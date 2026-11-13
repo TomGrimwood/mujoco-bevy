@@ -51,6 +51,15 @@ pub struct GeomStats {
 #[derive(Component)]
 pub struct GeomSlot(usize);
 
+impl GeomSlot {
+    /// Which surface geom of the scene list (then the user scene) this entity
+    /// draws, counting only geoms drawn as meshes.
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.0
+    }
+}
+
 /// How a geom type is drawn.
 enum Kind {
     Surface,
@@ -279,11 +288,15 @@ pub fn sync_surfaces(
 
     let existing = slots.iter().len();
     for (index, surface) in surfaces.iter().enumerate().skip(existing) {
+        // `Visibility` spelled out: `Mesh3d` gains it only through a render
+        // plugin's required components, and without it the slot query above
+        // never matches and every frame would spawn the list again.
         let mut entity = commands.spawn((
             GeomSlot(index),
             Mesh3d(surface.mesh.clone()),
             MeshMaterial3d(surface.material.clone()),
             surface.transform,
+            Visibility::Inherited,
         ));
         if !surface.casts_shadow {
             entity.insert(NotShadowCaster);

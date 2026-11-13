@@ -440,6 +440,75 @@ fn mip_chain(base: Vec<u8>, mut w: u32, mut h: u32) -> (Vec<u8>, u32) {
 mod tests {
     use super::*;
 
+    /// A unit cube given by its 8 corners and 12 triangles: every corner is
+    /// shared by several faces, so indexing has something to merge.
+    fn cube(texcoords: bool) -> MjModel {
+        let texcoord = if texcoords {
+            r#"texcoord="0 0 1 0 1 1 0 1 0 0 1 0 1 1 0 1""#
+        } else {
+            ""
+        };
+        let xml = format!(
+            r#"<mujoco><asset><mesh name="cube" smoothnormal="true"
+                vertex="0 0 0 1 0 0 1 1 0 0 1 0 0 0 1 1 0 1 1 1 1 0 1 1"
+                face="0 2 1 0 3 2 4 5 6 4 6 7 0 1 5 0 5 4 1 2 6 1 6 5 2 3 7 2 7 6 3 0 4 3 4 7"
+                {texcoord} /></asset>
+              <worldbody><geom type="mesh" mesh="cube" /></worldbody></mujoco>"#
+        );
+        MjModel::from_xml_string(&xml).expect("the cube compiles")
+    }
+
+    fn built(model: &MjModel) -> (ModelAssets, Assets<Mesh>) {
+        let (mut assets, mut meshes) = (ModelAssets::default(), Assets::<Mesh>::default());
+        assets.rebuild(model, &mut meshes, &mut Assets::<Image>::default());
+        (assets, meshes)
+    }
+
+    #[test]
+    fn shared_corners_are_merged_and_every_triangle_kept() {
+        let model = cube(false);
+        let (assets, meshes) = built(&model);
+        let (count, vertices, triangles) = assets.mesh_stats();
+        assert_eq!((count, triangles), (1, 12));
+        assert!(
+            vertices < 3 * triangles,
+            "{vertices} vertices for {triangles} triangles"
+        );
+        let (handle, has_uv) = assets.mesh(0).expect("mesh 0");
+        assert!(!has_uv);
+        let mesh = meshes.get(handle).expect("the mesh is in the store");
+        assert_eq!(mesh.count_vertices(), vertices);
+        assert_eq!(mesh.indices().map(bevy::mesh::Indices::len), Some(36));
+        assert_eq!(
+            mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+                .map(bevy::mesh::VertexAttributeValues::len),
+            Some(vertices)
+        );
+    }
+
+    #[test]
+    fn texture_coordinates_come_through_with_their_corners() {
+        let model = cube(true);
+        let (assets, meshes) = built(&model);
+        let (handle, has_uv) = assets.mesh(0).expect("mesh 0");
+        assert!(has_uv);
+        let mesh = meshes.get(handle).expect("the mesh is in the store");
+        assert_eq!(
+            mesh.attribute(Mesh::ATTRIBUTE_UV_0)
+                .map(bevy::mesh::VertexAttributeValues::len),
+            Some(mesh.count_vertices())
+        );
+    }
+
+    #[test]
+    fn a_rebuild_replaces_the_old_models_meshes() {
+        let model = cube(false);
+        let (mut assets, mut meshes) = built(&model);
+        let first = assets.mesh(0).expect("mesh 0").0.id();
+        assets.rebuild(&model, &mut meshes, &mut Assets::<Image>::default());
+        assert_ne!(assets.mesh(0).expect("mesh 0").0.id(), first);
+    }
+
     #[test]
     fn a_four_texel_texture_gets_two_levels_and_its_mean() {
         let base = [
