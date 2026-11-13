@@ -5,7 +5,7 @@ use bevy::math::DVec3;
 use bevy::prelude::*;
 
 use crate::MjView;
-use crate::camera::{Click, PendingClick};
+use crate::camera::{Click, Modifiers, PendingClick};
 
 /// What a click hit.
 #[derive(Clone, Debug)]
@@ -16,31 +16,28 @@ pub struct Pick {
     pub point: DVec3,
 }
 
-/// Sent once per click on the 3D view.
+/// Sent once per click on the 3D view, with the keys held: a host tells its
+/// own picks (a ruler, placing a machine) from a selection by them.
 #[derive(Message, Clone, Debug)]
-pub struct Picked(pub Pick);
+pub struct Picked {
+    pub pick: Pick,
+    pub modifiers: Modifiers,
+}
 
-/// The last click's pick; `MuJoCo`'s highlight and the perturb follow it.
+/// The last unmodified click's pick; `MuJoCo`'s highlight and the perturb
+/// follow it.
 #[derive(Resource, Default)]
 pub struct Selection(pub Option<Pick>);
 
-/// Lets go of a pick made on another model: its body and geom ids mean
-/// nothing in the new one.
-pub fn forget_old_model(
-    view: Res<MjView>,
-    mut selection: ResMut<Selection>,
-    mut seen: Local<Option<u64>>,
-) {
-    if seen
-        .replace(view.generation())
-        .is_some_and(|g| g != view.generation())
-    {
-        selection.0 = None;
-    }
+/// Lets go of the selection on a new model: its body and geom ids mean
+/// nothing there.
+pub fn forget_selection(mut selection: ResMut<Selection>) {
+    selection.0 = None;
 }
 
-/// Casts the ray for this frame's click, if there was one, and selects what
-/// it hit as `simulate` does: the body becomes the perturb's selection.
+/// Casts the ray for this frame's click, if there was one, and reports it.
+/// An unmodified click also selects what it hit, as `simulate` does: the body
+/// becomes the perturb's selection.
 pub fn pick_clicked(
     mut view: ResMut<MjView>,
     mut pending: ResMut<PendingClick>,
@@ -51,6 +48,13 @@ pub fn pick_clicked(
         return;
     };
     let pick = pick(&mut view, click);
+    if click.modifiers.any() {
+        picked.write(Picked {
+            pick,
+            modifiers: click.modifiers,
+        });
+        return;
+    }
     let body = pick.body.filter(|&b| b > 0);
     view.perturb.select = body.and_then(|b| i32::try_from(b).ok()).unwrap_or(0);
     view.perturb.skinselect = -1;
@@ -63,7 +67,10 @@ pub fn pick_clicked(
         }
     }
     selection.0 = Some(pick.clone());
-    picked.write(Picked(pick));
+    picked.write(Picked {
+        pick,
+        modifiers: click.modifiers,
+    });
 }
 
 /// `mjv_select` for `click`. The scene must have been updated at least once

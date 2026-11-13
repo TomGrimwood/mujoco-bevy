@@ -2,18 +2,22 @@
 //!
 //! The host owns the simulation. Each frame it copies the state it wants drawn
 //! into [`MjView::data`], a passive `MjData` (`MjData::copy_visual_to`), and may
-//! fill [`MjView::user_scene`] with overlay geoms. [`MujocoPlugin`] then runs
-//! `mjv_updateScene` and keeps one Bevy entity per geom in the list, so joint
-//! and camera markers, frames, contacts and perturb handles come for free. The
-//! camera, picking and perturbing go through `MuJoCo`'s own functions, so a pick
-//! uses the camera the picture was drawn with.
+//! fill [`MjView::user_scene`] with overlay geoms. [`MujocoScenePlugin`] then
+//! runs `mjv_updateScene` and keeps one Bevy entity per geom in the list, so
+//! joint and camera markers, frames, contacts and perturb handles come for
+//! free. Picking goes through `MuJoCo`'s own ray cast, against the camera the
+//! picture was drawn with.
+//!
+//! [`MujocoInputPlugin`] adds `simulate`'s mouse: orbit, pan, zoom, click to
+//! pick, Ctrl + drag to perturb. A host with its own input leaves it out and
+//! drives [`MjView::camera`] and [`PendingClick`] itself. [`MujocoPlugin`]
+//! adds both.
 //!
 //! `MuJoCo`'s world is used as it is: Z up, metres. Nothing is swapped.
 //!
-//! The host spawns one `Camera3d` with [`MjCamera`] on it, sets its viewport,
-//! and says through [`ViewInput`] when the pointer belongs to its UI.
-
-use std::sync::Arc;
+//! The host spawns one `Camera3d` with [`MjCamera`] on it and sets its
+//! viewport; more cameras can follow the model's own cameras through
+//! [`ModelCamera`].
 
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
@@ -24,23 +28,39 @@ mod lights;
 mod pick;
 mod scene;
 
-pub use camera::{Click, MjCamera, PendingClick, ViewInput};
+pub use camera::{Click, MjCamera, ModelCamera, Modifiers, PendingClick, ViewInput};
 pub use lights::{LightSettings, MjLight};
-pub use mujoco_bevy_assets::ModelAssets;
+pub use mujoco_bevy_assets::{ModelAssets, RebuildStats};
 pub use pick::{Pick, Picked, Selection, pick};
 pub use scene::{GeomSlot, GeomStats, Label, Labels};
 
-/// Room for the geoms of a busy scene: every part, contacts and decor.
-pub const DEFAULT_MAX_GEOM: usize = 20_000;
+/// How many geoms the scenes hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capacity {
+    /// The scene `mjv_updateScene` fills: every part, contacts and decor.
+    pub scene: usize,
+    /// The host's overlays.
+    pub user: usize,
+}
+
+impl Default for Capacity {
+    /// Room for a busy scene, and the classic viewer's overlay size.
+    fn default() -> Self {
+        Self {
+            scene: 20_000,
+            user: 512,
+        }
+    }
+}
 
 /// What is drawn and how it is looked at: the passive copy of the state, the
 /// scenes built from it, and `MuJoCo`'s own option, perturb and camera.
 #[derive(Resource)]
 pub struct MjView {
-    pub(crate) model: Arc<MjModel>,
-    /// The state to draw. The host copies into it each frame; the plugin only
-    /// reads it, except that `mjv_updateScene` and `mjv_select` take it `mut`.
-    pub data: MjData<Arc<MjModel>>,
+    /// The state to draw, on the view's own copy of the model. The host
+    /// copies into it each frame; the plugin only reads it, except that
+    /// `mjv_updateScene` and `mjv_select` take it `mut`.
+    pub data: MjData<Box<MjModel>>,
     /// Rebuilt from [`Self::data`] every frame.
     pub scene: MjvScene,
     /// The host's overlays, drawn after [`Self::scene`]. The plugin never
@@ -51,58 +71,173 @@ pub struct MjView {
     /// simulated data (`MjvPerturb::apply`), not to [`Self::data`].
     pub perturb: MjvPerturb,
     pub camera: MjvCamera,
+    capacity: Capacity,
     generation: u64,
     scene_ready: bool,
+    /// Meshes rewritten in place, for their Bevy meshes to follow.
+    meshes_rewritten: Vec<usize>,
+}
+
+/// What [`MjView::refresh_model`] made of a model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refresh {
+    /// Same layout: values copied, assets and entities kept.
+    InPlace,
+    /// Another layout: handled as [`MjView::set_model`].
+    Replaced,
 }
 
 impl MjView {
-    /// A view of `model` with `MuJoCo`'s default options and a free camera.
+    /// A view of a copy of `model`, with `MuJoCo`'s default options, a free
+    /// camera and [`Capacity::default`].
     #[must_use]
-    pub fn new(model: Arc<MjModel>) -> Self {
-        let mut data = MjData::new(Arc::clone(&model));
+    pub fn new(model: &MjModel) -> Self {
+        Self::with_capacity(model, Capacity::default())
+    }
+
+    #[must_use]
+    pub fn with_capacity(model: &MjModel, capacity: Capacity) -> Self {
+        let mut data = MjData::new(Box::new(model.clone()));
         data.forward();
         Self {
-            scene: MjvScene::new(&model, DEFAULT_MAX_GEOM),
-            user_scene: MjvScene::new(&model, DEFAULT_MAX_GEOM / 4),
-            camera: MjvCamera::new_free(&model),
+            scene: MjvScene::new(model, capacity.scene),
+            user_scene: MjvScene::new(model, capacity.user),
+            camera: MjvCamera::new_free(model),
             option: MjvOption::default(),
             perturb: MjvPerturb::default(),
             data,
-            model,
+            capacity,
             generation: 0,
             scene_ready: false,
+            meshes_rewritten: Vec::new(),
         }
     }
 
-    /// Replaces the model, as the app does when it recompiles. Every Bevy
-    /// asset made for the old model is dropped on the next frame. The camera
-    /// keeps where it looks from; a tracked body that no longer exists, and
-    /// any selection, are let go.
-    pub fn set_model(&mut self, model: Arc<MjModel>) {
+    /// Replaces the model, as the app does when it recompiles: the scenes,
+    /// the entities and the assets follow on the next frame (assets whose
+    /// content is unchanged are kept). The camera keeps where it looks from;
+    /// a tracked body or a fixed camera that no longer exists, and any
+    /// selection, are let go.
+    pub fn set_model(&mut self, model: &MjModel) {
         let camera = self.camera.clone();
         let option = self.option.clone();
         *self = Self {
             generation: self.generation + 1,
-            ..Self::new(model)
+            ..Self::with_capacity(model, self.capacity)
         };
         self.camera = camera;
         self.option = option;
         let tracked_gone = self.camera.type_ == MjtCamera::mjCAMERA_TRACKING as i32
-            && !(0..self.model.nbody()).contains(&i64::from(self.camera.trackbodyid));
+            && !(0..model.nbody()).contains(&i64::from(self.camera.trackbodyid));
         let fixed_gone = self.camera.type_ == MjtCamera::mjCAMERA_FIXED as i32
-            && !(0..self.model.ncam()).contains(&i64::from(self.camera.fixedcamid));
+            && !(0..model.ncam()).contains(&i64::from(self.camera.fixedcamid));
         if tracked_gone || fixed_gone {
             self.camera.free();
         }
     }
 
-    #[must_use]
-    pub const fn model(&self) -> &Arc<MjModel> {
-        &self.model
+    /// Takes `model`'s values (colours, materials, lights, sizes) where only
+    /// values changed, as after a paint edit: no rebuild, no respawn, the new
+    /// colours reach the materials through the next scene. A model of another
+    /// layout is a new model.
+    pub fn refresh_model(&mut self, model: &MjModel) -> Refresh {
+        if self.data.try_swap_model(Box::new(model.clone())).is_ok() {
+            Refresh::InPlace
+        } else {
+            self.set_model(model);
+            Refresh::Replaced
+        }
     }
 
-    /// Bumped by every [`Self::set_model`], so caches keyed on the model know
-    /// when to rebuild.
+    /// Takes mesh `id`'s vertices, normals, texture coordinates and faces
+    /// from `model`, where the app rewrote them in place (a bucket's load, a
+    /// design's ground), and has its Bevy mesh rebuilt under the same handle
+    /// next frame. Picks see the new shape too. Returns `false`, changing
+    /// nothing, when `model` is not laid out as the view's or the mesh's
+    /// counts differ.
+    pub fn update_mesh(&mut self, model: &MjModel, id: usize) -> bool {
+        let ours = self.data.model();
+        if !ours.is_compatible_with_model(model) || id >= usize::try_from(ours.nmesh()).unwrap_or(0)
+        {
+            return false;
+        }
+        let counts = |m: &MjModel| {
+            (
+                m.mesh_vertnum()[id],
+                m.mesh_normalnum()[id],
+                m.mesh_facenum()[id],
+                m.mesh_texcoordnum()[id],
+            )
+        };
+        if counts(ours) != counts(model) {
+            return false;
+        }
+        let at = |a: i32| usize::try_from(a).unwrap_or(0);
+        let (v0, nv) = (at(model.mesh_vertadr()[id]), at(model.mesh_vertnum()[id]));
+        let (n0, nn) = (
+            at(model.mesh_normaladr()[id]),
+            at(model.mesh_normalnum()[id]),
+        );
+        let (f0, nf) = (at(model.mesh_faceadr()[id]), at(model.mesh_facenum()[id]));
+        let texcoords = usize::try_from(model.mesh_texcoordadr()[id])
+            .ok()
+            .map(|t0| (t0, at(model.mesh_texcoordnum()[id])));
+        let src = model.ffi();
+        // SAFETY: both models have one layout and this mesh has the same
+        // counts in each, so every range below is inside both buffers; the
+        // buffers belong to different models, so they do not overlap; and
+        // only the mesh's own values change, no address or count.
+        unsafe {
+            let dst = self.data.model_mut().ffi_mut();
+            std::ptr::copy_nonoverlapping(
+                src.mesh_vert.add(3 * v0),
+                dst.mesh_vert.add(3 * v0),
+                3 * nv,
+            );
+            std::ptr::copy_nonoverlapping(
+                src.mesh_normal.add(3 * n0),
+                dst.mesh_normal.add(3 * n0),
+                3 * nn,
+            );
+            std::ptr::copy_nonoverlapping(
+                src.mesh_face.add(3 * f0),
+                dst.mesh_face.add(3 * f0),
+                3 * nf,
+            );
+            std::ptr::copy_nonoverlapping(
+                src.mesh_facenormal.add(3 * f0),
+                dst.mesh_facenormal.add(3 * f0),
+                3 * nf,
+            );
+            if let Some((t0, nt)) = texcoords {
+                std::ptr::copy_nonoverlapping(
+                    src.mesh_texcoord.add(2 * t0),
+                    dst.mesh_texcoord.add(2 * t0),
+                    2 * nt,
+                );
+                std::ptr::copy_nonoverlapping(
+                    src.mesh_facetexcoord.add(3 * f0),
+                    dst.mesh_facetexcoord.add(3 * f0),
+                    3 * nf,
+                );
+            }
+        }
+        self.meshes_rewritten.push(id);
+        true
+    }
+
+    /// The view's own copy of the model.
+    #[must_use]
+    pub fn model(&self) -> &MjModel {
+        self.data.model()
+    }
+
+    #[must_use]
+    pub const fn capacity(&self) -> Capacity {
+        self.capacity
+    }
+
+    /// Bumped by every [`Self::set_model`]; [`ModelChanged`] says so too.
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
@@ -129,6 +264,13 @@ impl MjView {
     }
 }
 
+/// Sent the first frame [`MjView`] holds a model, and after every
+/// [`MjView::set_model`]: what was made for the old one is no longer valid.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct ModelChanged {
+    pub generation: u64,
+}
+
 /// Where the plugin's work sits in `PostUpdate`, so a host can order its own
 /// systems against it: copy state and write overlays before [`Self::Scene`],
 /// read [`Labels`] and [`Selection`] after [`Self::Draw`].
@@ -136,43 +278,51 @@ impl MjView {
 pub enum MjSystems {
     /// `mjv_updateScene`, then the pick asked for this frame.
     Scene,
-    /// Entities, lights, gizmos, labels and the camera from the scene.
+    /// Entities, lights, gizmos, labels and the cameras from the scene.
     Draw,
 }
 
-/// Draws the [`MjView`] resource. Insert the resource before the first
-/// frame; frames without it draw nothing.
-pub struct MujocoPlugin;
+/// Draws [`MjView`].
+///
+/// Assets, the geom list as entities, lines, labels, lights, the cameras,
+/// and picks asked for through [`PendingClick`]. Insert the resource before
+/// the first frame; frames without it draw nothing.
+pub struct MujocoScenePlugin;
 
-impl Plugin for MujocoPlugin {
+impl Plugin for MujocoScenePlugin {
     fn build(&self, app: &mut App) {
-        let has_view = resource_exists::<MjView>;
+        let model_changed = on_message::<ModelChanged>;
         app.add_plugins(mujoco_bevy_assets::MujocoAssetsPlugin)
             .init_resource::<Labels>()
             .init_resource::<GeomStats>()
             .init_resource::<LightSettings>()
-            .init_resource::<ViewInput>()
             .init_resource::<PendingClick>()
             .init_resource::<Selection>()
             .add_message::<Picked>()
+            .add_message::<ModelChanged>()
             .configure_sets(
                 PostUpdate,
                 (MjSystems::Scene, MjSystems::Draw)
                     .chain()
-                    .run_if(has_view)
+                    .run_if(resource_exists::<MjView>)
                     .before(TransformSystems::Propagate),
             )
-            .add_systems(Update, camera::mouse.run_if(has_view))
             .add_systems(
                 PostUpdate,
                 (
-                    (pick::forget_old_model, update_scene, pick::pick_clicked)
+                    (
+                        notice_new_model,
+                        pick::forget_selection.run_if(model_changed),
+                        update_scene,
+                        pick::pick_clicked,
+                    )
                         .chain()
                         .in_set(MjSystems::Scene),
                     (
                         (
-                            rebuild_assets,
-                            scene::despawn_on_new_model,
+                            rebuild_assets.run_if(model_changed),
+                            scene::despawn_slots.run_if(model_changed),
+                            rewrite_meshes,
                             scene::sync_surfaces,
                         )
                             .chain(),
@@ -182,6 +332,8 @@ impl Plugin for MujocoPlugin {
                         lights::sync_lights,
                         lights::sync_ambient,
                         camera::sync_camera,
+                        camera::sync_model_cameras,
+                        camera::warn_many_cameras,
                     )
                         .in_set(MjSystems::Draw),
                 ),
@@ -189,20 +341,64 @@ impl Plugin for MujocoPlugin {
     }
 }
 
+/// `simulate`'s mouse over the [`MjCamera`]'s viewport: drag to orbit, pan
+/// and zoom, click to pick, Ctrl + drag on the selection to perturb. Needs
+/// [`MujocoScenePlugin`].
+pub struct MujocoInputPlugin;
+
+impl Plugin for MujocoInputPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<ViewInput>()
+            .add_systems(Update, camera::mouse.run_if(resource_exists::<MjView>));
+    }
+}
+
+/// [`MujocoScenePlugin`] and [`MujocoInputPlugin`].
+pub struct MujocoPlugin;
+
+impl Plugin for MujocoPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_plugins((MujocoScenePlugin, MujocoInputPlugin));
+    }
+}
+
+/// Says [`ModelChanged`] the frame the view's generation is new to it.
+fn notice_new_model(
+    view: Res<MjView>,
+    mut seen: Local<Option<u64>>,
+    mut changed: MessageWriter<ModelChanged>,
+) {
+    let generation = view.generation();
+    if seen.replace(generation) != Some(generation) {
+        changed.write(ModelChanged { generation });
+    }
+}
+
 fn update_scene(mut view: ResMut<MjView>) {
     view.update_scene();
 }
 
-/// Rebuilds the model's Bevy assets the frame [`MjView`] holds a new model.
 fn rebuild_assets(
     view: Res<MjView>,
     mut assets: ResMut<ModelAssets>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
-    mut built: Local<Option<u64>>,
 ) {
-    if built.replace(view.generation()) != Some(view.generation()) {
-        assets.rebuild(view.model(), &mut meshes, &mut images);
+    assets.rebuild(view.model(), &mut meshes, &mut images);
+}
+
+/// The Bevy meshes of meshes the host rewrote in place.
+fn rewrite_meshes(
+    mut view: ResMut<MjView>,
+    mut assets: ResMut<ModelAssets>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    if view.meshes_rewritten.is_empty() {
+        return;
+    }
+    let ids = std::mem::take(&mut view.meshes_rewritten);
+    for id in ids {
+        assets.update_mesh(view.model(), id, &mut meshes);
     }
 }
 

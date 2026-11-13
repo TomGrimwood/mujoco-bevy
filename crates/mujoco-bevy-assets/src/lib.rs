@@ -2,11 +2,17 @@
 //! built once per model, and the unit primitive meshes every geom scales.
 //!
 //! Add [`MujocoAssetsPlugin`], then call [`ModelAssets::rebuild`] whenever the
-//! model changes. Drawing the model is `mujoco-bevy`'s business, not this
-//! crate's.
+//! model changes, and [`ModelAssets::update_mesh`] when one mesh is rewritten
+//! in place. Drawing the model is `mujoco-bevy`'s business, not this crate's.
+//!
+//! Meshes and textures are keyed by their content: a recompile that leaves a
+//! part unchanged keeps its Bevy asset, and two identical meshes in one model
+//! share one.
 
 use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
+use std::hash::{DefaultHasher, Hasher};
+use std::time::{Duration, Instant};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -21,15 +27,32 @@ use mujoco_rs::prelude::*;
 /// otherwise grow it without end.
 const MATERIAL_CACHE_CAP: usize = 4096;
 
-/// Everything made for one model. A new model replaces all of it; the old
-/// handles drop and Bevy frees the assets once no entity holds them.
+/// Everything made for one model. A new model replaces it; a handle the new
+/// model does not reuse drops, and Bevy frees the asset once no entity holds
+/// it.
 #[derive(Resource, Default)]
 pub struct ModelAssets {
     meshes: Vec<ModelMesh>,
     textures: Vec<Option<Handle<Image>>>,
+    /// The meshes and textures of the current model by content, for the next
+    /// rebuild to reuse.
+    mesh_by_content: HashMap<u64, ModelMesh>,
+    texture_by_content: HashMap<u64, Handle<Image>>,
     materials: HashMap<MaterialKey, Handle<StandardMaterial>>,
     primitives: Option<Primitives>,
     capsules: HashMap<u32, Handle<Mesh>>,
+    last_rebuild: RebuildStats,
+}
+
+/// What the last [`ModelAssets::rebuild`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RebuildStats {
+    pub took: Duration,
+    pub meshes_built: usize,
+    /// Kept from the model before, or shared with an identical mesh.
+    pub meshes_reused: usize,
+    pub textures_built: usize,
+    pub textures_reused: usize,
 }
 
 #[derive(Clone)]
@@ -199,22 +222,92 @@ impl ModelAssets {
         self.materials.len()
     }
 
-    /// Replaces every mesh, texture and cached material with `model`'s. The
-    /// old handles drop here, so the old model's assets are freed once no
-    /// entity holds them.
+    /// What the last [`Self::rebuild`] cost and reused.
+    #[must_use]
+    pub const fn last_rebuild(&self) -> RebuildStats {
+        self.last_rebuild
+    }
+
+    /// Replaces every mesh, texture and cached material with `model`'s,
+    /// keeping the Bevy asset of any mesh or texture whose content the model
+    /// before had too. Handles not kept drop here, so the old model's assets
+    /// are freed once no entity holds them.
     pub fn rebuild(
         &mut self,
         model: &MjModel,
         meshes: &mut Assets<Mesh>,
         images: &mut Assets<Image>,
     ) {
+        let started = Instant::now();
+        let mut stats = RebuildStats::default();
         self.materials.clear();
+
+        let mut before = std::mem::take(&mut self.mesh_by_content);
         self.meshes = (0..to_usize(model.nmesh()))
-            .map(|id| build_mesh(model, id, meshes))
+            .map(|id| {
+                let key = mesh_key(model, id);
+                let reused = self
+                    .mesh_by_content
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| before.remove(&key));
+                let mesh = reused.map_or_else(
+                    || {
+                        stats.meshes_built += 1;
+                        build_mesh(model, id, meshes)
+                    },
+                    |mesh| {
+                        stats.meshes_reused += 1;
+                        mesh
+                    },
+                );
+                self.mesh_by_content.insert(key, mesh.clone());
+                mesh
+            })
             .collect();
+
+        let mut before = std::mem::take(&mut self.texture_by_content);
         self.textures = (0..to_usize(model.ntex()))
-            .map(|id| build_texture(model, id).map(|image| images.add(image)))
+            .map(|id| {
+                let (key, image) = texture_key(model, id)?;
+                let reused = self
+                    .texture_by_content
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| before.remove(&key));
+                let handle = if let Some(handle) = reused {
+                    stats.textures_reused += 1;
+                    handle
+                } else {
+                    stats.textures_built += 1;
+                    images.add(build_texture(image))
+                };
+                self.texture_by_content.insert(key, handle.clone());
+                Some(handle)
+            })
             .collect();
+
+        stats.took = started.elapsed();
+        self.last_rebuild = stats;
+    }
+
+    /// Rewrites `MuJoCo` mesh `id` from `model` under the handle it has, so
+    /// every entity drawing it shows the new shape. For a mesh rewritten in
+    /// place between recompiles; the topology may change, the mesh id may
+    /// not. Returns whether there was such a mesh.
+    pub fn update_mesh(&mut self, model: &MjModel, id: usize, meshes: &mut Assets<Mesh>) -> bool {
+        let Some(slot) = self.meshes.get_mut(id) else {
+            return false;
+        };
+        let (mesh, built) = mesh_of(model, id);
+        // Its old content no longer describes it: keep it out of the reuse
+        // map, or a later model with the old shape would get the new one.
+        self.mesh_by_content.retain(|_, m| m.handle != slot.handle);
+        slot.has_uv = built.has_uv;
+        slot.vertices = built.vertices;
+        slot.triangles = built.triangles;
+        // Same handle: the entities holding it need no change.
+        meshes.insert(slot.handle.id(), mesh).is_ok()
     }
 }
 
@@ -293,9 +386,52 @@ fn init_primitives(mut assets: ResMut<ModelAssets>, mut meshes: ResMut<Assets<Me
     });
 }
 
-/// One indexed mesh: `MuJoCo` indexes positions, normals and texture
-/// coordinates apart, so corners that agree on all three are merged.
+/// A hash of everything a mesh is built from: its vertices, normals, texture
+/// coordinates and faces.
+fn mesh_key(model: &MjModel, id: usize) -> u64 {
+    let v0 = to_usize(model.mesh_vertadr()[id]);
+    let nv = to_usize(model.mesh_vertnum()[id]);
+    let n0 = to_usize(model.mesh_normaladr()[id]);
+    let nn = to_usize(model.mesh_normalnum()[id]);
+    let f0 = to_usize(model.mesh_faceadr()[id]);
+    let nf = to_usize(model.mesh_facenum()[id]);
+    let mut hasher = DefaultHasher::new();
+    hasher.write(as_bytes(&model.mesh_vert()[v0..v0 + nv]));
+    hasher.write(as_bytes(&model.mesh_normal()[n0..n0 + nn]));
+    hasher.write(as_bytes(&model.mesh_face()[f0..f0 + nf]));
+    hasher.write(as_bytes(&model.mesh_facenormal()[f0..f0 + nf]));
+    if let Ok(t0) = usize::try_from(model.mesh_texcoordadr()[id]) {
+        let nt = to_usize(model.mesh_texcoordnum()[id]);
+        hasher.write(as_bytes(&model.mesh_texcoord()[t0..t0 + nt]));
+        hasher.write(as_bytes(&model.mesh_facetexcoord()[f0..f0 + nf]));
+    }
+    hasher.finish()
+}
+
+/// The bytes of plain number arrays, for hashing.
+const fn as_bytes<T: Plain>(values: &[T]) -> &[u8] {
+    // SAFETY: `Plain` types are arrays of `f32` or `i32`: no padding, every
+    // byte initialised, and `u8` has no alignment to keep.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+/// Arrays of `f32` or `i32`, with no padding.
+trait Plain: Copy {}
+impl Plain for [f32; 2] {}
+impl Plain for [f32; 3] {}
+impl Plain for [i32; 3] {}
+impl Plain for u8 {}
+
 fn build_mesh(model: &MjModel, id: usize, meshes: &mut Assets<Mesh>) -> ModelMesh {
+    let (mesh, mut built) = mesh_of(model, id);
+    built.handle = meshes.add(mesh);
+    built
+}
+
+/// One indexed mesh, and what it holds (with a placeholder handle):
+/// `MuJoCo` indexes positions, normals and texture coordinates apart, so
+/// corners that agree on all three are merged.
+fn mesh_of(model: &MjModel, id: usize) -> (Mesh, ModelMesh) {
     let v0 = to_usize(model.mesh_vertadr()[id]);
     let n0 = to_usize(model.mesh_normaladr()[id]);
     let f0 = to_usize(model.mesh_faceadr()[id]);
@@ -336,18 +472,36 @@ fn build_mesh(model: &MjModel, id: usize, meshes: &mut Assets<Mesh>) -> ModelMes
     if has_uv {
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv);
     }
-    ModelMesh {
-        handle: meshes.add(mesh),
+    let built = ModelMesh {
+        handle: Handle::default(),
         has_uv,
         vertices,
         triangles: nf,
-    }
+    };
+    (mesh, built)
 }
 
-/// A 2D texture as an sRGB (or linear, if the model says so) RGBA image with
-/// a full mip chain, repeating, as `MuJoCo` samples it. Cube maps and the
-/// skybox are left out.
-fn build_texture(model: &MjModel, id: usize) -> Option<Image> {
+/// A 2D texture's pixels as RGBA, and its size and colour space.
+struct TextureSource {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+}
+
+/// A hash of a 2D texture's pixels, size and colour space, and the decoded
+/// texture. Cube maps and the skybox are left out.
+fn texture_key(model: &MjModel, id: usize) -> Option<(u64, TextureSource)> {
+    let source = decode_texture(model, id)?;
+    let mut hasher = DefaultHasher::new();
+    hasher.write(as_bytes(&source.rgba));
+    hasher.write_u32(source.width);
+    hasher.write_u32(source.height);
+    hasher.write_u8(u8::from(source.format == TextureFormat::Rgba8Unorm));
+    Some((hasher.finish(), source))
+}
+
+fn decode_texture(model: &MjModel, id: usize) -> Option<TextureSource> {
     if model.tex_type()[id] != MjtTexture::mjTEXTURE_2D {
         return None;
     }
@@ -373,6 +527,23 @@ fn build_texture(model: &MjModel, id: usize) -> Option<Image> {
     } else {
         TextureFormat::Rgba8UnormSrgb
     };
+    Some(TextureSource {
+        rgba,
+        width: w,
+        height: h,
+        format,
+    })
+}
+
+/// An sRGB (or linear, if the model says so) RGBA image with a full mip
+/// chain, repeating, as `MuJoCo` samples it.
+fn build_texture(source: TextureSource) -> Image {
+    let TextureSource {
+        rgba,
+        width: w,
+        height: h,
+        format,
+    } = source;
     let base = rgba.len();
     let (data, levels) = mip_chain(rgba, w, h);
     // `Image::new` checks the data against the base level alone.
@@ -398,7 +569,7 @@ fn build_texture(model: &MjModel, id: usize) -> Option<Image> {
         anisotropy_clamp: 16,
         ..default()
     });
-    Some(image)
+    image
 }
 
 /// Box-filtered mip levels appended to `base`. A ground texture repeated a
@@ -500,13 +671,60 @@ mod tests {
         );
     }
 
+    /// The cube, scaled: same faces, other vertices.
+    fn big_cube() -> MjModel {
+        let xml = r#"<mujoco><asset><mesh name="cube" scale="2 2 2"
+                vertex="0 0 0 1 0 0 1 1 0 0 1 0 0 0 1 1 0 1 1 1 1 0 1 1"
+                face="0 2 1 0 3 2 4 5 6 4 6 7 0 1 5 0 5 4 1 2 6 1 6 5 2 3 7 2 7 6 3 0 4 3 4 7" /></asset>
+              <worldbody><geom type="mesh" mesh="cube" /></worldbody></mujoco>"#;
+        MjModel::from_xml_string(xml).expect("the cube compiles")
+    }
+
     #[test]
-    fn a_rebuild_replaces_the_old_models_meshes() {
+    fn a_rebuild_keeps_what_did_not_change_and_rebuilds_what_did() {
         let model = cube(false);
         let (mut assets, mut meshes) = built(&model);
         let first = assets.mesh(0).expect("mesh 0").0.id();
         assets.rebuild(&model, &mut meshes, &mut Assets::<Image>::default());
+        assert_eq!(assets.mesh(0).expect("mesh 0").0.id(), first);
+        assert_eq!(
+            (
+                assets.last_rebuild().meshes_built,
+                assets.last_rebuild().meshes_reused
+            ),
+            (0, 1)
+        );
+
+        assets.rebuild(&big_cube(), &mut meshes, &mut Assets::<Image>::default());
         assert_ne!(assets.mesh(0).expect("mesh 0").0.id(), first);
+        assert_eq!(assets.last_rebuild().meshes_built, 1);
+    }
+
+    #[test]
+    fn an_updated_mesh_keeps_its_handle_and_takes_the_new_shape() {
+        let (mut assets, mut meshes) = built(&cube(false));
+        let handle = assets.mesh(0).expect("mesh 0").0.clone();
+        let positions = |meshes: &Assets<Mesh>| {
+            meshes
+                .get(&handle)
+                .and_then(|m| m.attribute(Mesh::ATTRIBUTE_POSITION))
+                .and_then(bevy::mesh::VertexAttributeValues::as_float3)
+                .map(<[[f32; 3]]>::to_vec)
+                .expect("positions")
+        };
+        let small = positions(&meshes);
+        assert!(assets.update_mesh(&big_cube(), 0, &mut meshes));
+        assert_eq!(assets.mesh(0).expect("mesh 0").0.id(), handle.id());
+        let big = positions(&meshes);
+        let extent = |p: &[[f32; 3]]| {
+            p.iter().map(|v| v[0]).fold(f32::MIN, f32::max)
+                - p.iter().map(|v| v[0]).fold(f32::MAX, f32::min)
+        };
+        assert!((extent(&big) / extent(&small) - 2.0).abs() < 1e-5);
+        assert!(
+            !assets.update_mesh(&big_cube(), 1, &mut meshes),
+            "no mesh 1"
+        );
     }
 
     #[test]

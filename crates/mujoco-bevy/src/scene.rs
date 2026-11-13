@@ -47,16 +47,60 @@ pub struct GeomStats {
     pub triangles: usize,
 }
 
-/// Marks the entity that draws the `n`-th surface geom of the list.
-#[derive(Component)]
-pub struct GeomSlot(usize);
+/// Marks the entity that draws the `n`-th surface geom of the list, and says
+/// what that geom is this frame. A slot is reused for whatever geom is `n`-th,
+/// so its identity can change when the list does.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeomSlot {
+    index: usize,
+    category: i32,
+    objtype: i32,
+    objid: i32,
+}
 
 impl GeomSlot {
+    const fn of(index: usize, geom: &MjvGeom) -> Self {
+        Self {
+            index,
+            category: geom.category,
+            objtype: geom.objtype,
+            objid: geom.objid,
+        }
+    }
+
     /// Which surface geom of the scene list (then the user scene) this entity
     /// draws, counting only geoms drawn as meshes.
     #[must_use]
     pub const fn index(&self) -> usize {
-        self.0
+        self.index
+    }
+
+    /// `mjtCatBit`: static, dynamic or decor (frames, contacts, perturb
+    /// handles, the host's overlays).
+    #[must_use]
+    pub const fn category(&self) -> i32 {
+        self.category
+    }
+
+    /// `mjtObj` of what the geom stands for (`mjOBJ_GEOM` for a model geom),
+    /// or `mjOBJ_UNKNOWN` for an overlay.
+    #[must_use]
+    pub const fn objtype(&self) -> i32 {
+        self.objtype
+    }
+
+    /// The id of [`Self::objtype`]'s object, or -1 for none.
+    #[must_use]
+    pub const fn objid(&self) -> i32 {
+        self.objid
+    }
+
+    /// The model geom drawn, if the slot draws one.
+    #[must_use]
+    pub fn model_geom(&self) -> Option<usize> {
+        (self.objtype == MjtObj::mjOBJ_GEOM as i32)
+            .then(|| usize::try_from(self.objid).ok())
+            .flatten()
     }
 }
 
@@ -117,6 +161,7 @@ fn frame_of(geom: &MjvGeom, scale: Vec3) -> Transform {
 
 /// One surface geom, ready to draw.
 pub struct Surface {
+    slot: GeomSlot,
     mesh: Handle<Mesh>,
     material: Handle<StandardMaterial>,
     transform: Transform,
@@ -208,6 +253,7 @@ impl SurfaceAssets<'_> {
             uv_scale,
         };
         Some(Surface {
+            slot: GeomSlot::of(0, geom),
             mesh,
             material: self.model.material(&mut self.materials, &look),
             transform,
@@ -217,17 +263,10 @@ impl SurfaceAssets<'_> {
     }
 }
 
-/// Despawns every geom entity when the model changes: its list is another.
-pub fn despawn_on_new_model(
-    mut commands: Commands,
-    view: Res<MjView>,
-    slots: Query<Entity, With<GeomSlot>>,
-    mut seen: Local<Option<u64>>,
-) {
-    if seen.replace(view.generation()) != Some(view.generation()) {
-        for entity in &slots {
-            commands.entity(entity).despawn();
-        }
+/// Despawns every geom entity: a new model's list is another.
+pub fn despawn_slots(mut commands: Commands, slots: Query<Entity, With<GeomSlot>>) {
+    for entity in &slots {
+        commands.entity(entity).despawn();
     }
 }
 
@@ -236,7 +275,7 @@ type Slots<'w, 's> = Query<
     's,
     (
         Entity,
-        &'static GeomSlot,
+        &'static mut GeomSlot,
         &'static mut Mesh3d,
         &'static mut MeshMaterial3d<StandardMaterial>,
         &'static mut Transform,
@@ -261,14 +300,18 @@ pub fn sync_surfaces(
             .filter(|g| matches!(kind(g), Kind::Surface))
             .filter_map(|g| assets.surface(g)),
     );
+    for (index, surface) in surfaces.iter_mut().enumerate() {
+        surface.slot.index = index;
+    }
 
-    for (entity, slot, mut mesh, mut material, mut transform, mut visibility, shadowless) in
+    for (entity, mut slot, mut mesh, mut material, mut transform, mut visibility, shadowless) in
         &mut slots
     {
-        let Some(surface) = surfaces.get(slot.0) else {
+        let Some(surface) = surfaces.get(slot.index) else {
             visibility.set_if_neq(Visibility::Hidden);
             continue;
         };
+        slot.set_if_neq(surface.slot);
         if mesh.0 != surface.mesh {
             mesh.0 = surface.mesh.clone();
         }
@@ -287,12 +330,12 @@ pub fn sync_surfaces(
     }
 
     let existing = slots.iter().len();
-    for (index, surface) in surfaces.iter().enumerate().skip(existing) {
+    for surface in surfaces.iter().skip(existing) {
         // `Visibility` spelled out: `Mesh3d` gains it only through a render
         // plugin's required components, and without it the slot query above
         // never matches and every frame would spawn the list again.
         let mut entity = commands.spawn((
-            GeomSlot(index),
+            surface.slot,
             Mesh3d(surface.mesh.clone()),
             MeshMaterial3d(surface.material.clone()),
             surface.transform,

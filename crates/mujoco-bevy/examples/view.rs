@@ -7,8 +7,6 @@
 //! Left drag rotates, right drag pans, the wheel zooms, a click selects a body
 //! (its name is printed), Ctrl + drag on it pushes it around.
 
-use std::sync::Arc;
-
 use bevy::prelude::*;
 use mujoco_bevy::{MjCamera, MjView, MujocoPlugin, Picked};
 use mujoco_rs::prelude::*;
@@ -43,19 +41,17 @@ const DEMO: &str = r#"<mujoco model="demo">
 
 /// The simulated state; the view draws a copy of it.
 #[derive(Resource)]
-struct Sim(MjData<Arc<MjModel>>);
+struct Sim(MjData<Box<MjModel>>);
 
 fn main() {
-    let model = Arc::new(
-        std::env::args()
-            .nth(1)
-            .map_or_else(|| MjModel::from_xml_string(DEMO), MjModel::from_xml)
-            .expect("the model compiles"),
-    );
+    let model = std::env::args()
+        .nth(1)
+        .map_or_else(|| MjModel::from_xml_string(DEMO), MjModel::from_xml)
+        .expect("the model compiles");
     App::new()
         .add_plugins((DefaultPlugins, MujocoPlugin))
-        .insert_resource(MjView::new(Arc::clone(&model)))
-        .insert_resource(Sim(MjData::new(model)))
+        .insert_resource(MjView::new(&model))
+        .insert_resource(Sim(MjData::new(Box::new(model))))
         .add_systems(Startup, |mut commands: Commands| {
             commands.spawn((Camera3d::default(), MjCamera));
         })
@@ -82,11 +78,11 @@ fn step(mut sim: ResMut<Sim>, mut view: ResMut<MjView>, time: Res<Time>) {
 }
 
 fn print_picks(mut picked: MessageReader<Picked>, view: Res<MjView>) {
-    for Picked(pick) in picked.read() {
+    for Picked { pick, modifiers } in picked.read() {
         let name = pick
             .body
             .and_then(|b| view.model().id_to_name(MjtObjBase::mjOBJ_BODY, b))
             .unwrap_or("nothing");
-        println!("picked {name} at {:?}", pick.point);
+        println!("picked {name} at {:?} ({modifiers:?})", pick.point);
     }
 }
