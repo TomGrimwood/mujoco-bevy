@@ -46,9 +46,9 @@ bevy_egui = { version = "0.43.1", default-features = false, features = [
 egui = "0.36"
 # Upstream mujoco-rs wrappers, no viewer: everything drawn here goes through
 # MuJoCo's abstract scene (mjv_*), not its OpenGL renderer. Links the MuJoCo
-# that MUJOCO_DYNAMIC_LINK_DIR names. A consumer that also links a fork
-# patches crates-io to it, so its program holds one mujoco-rs.
-mujoco-rs = { version = "7", default-features = false }
+# that MUJOCO_DYNAMIC_LINK_DIR names (3.17.0). Pinned to a release tag:
+# upstream's main moves to newer MuJoCo versions.
+mujoco-rs = { git = "https://github.com/davidhozic/mujoco-rs", tag = "7.1.0", default-features = false }
 mujoco-bevy-assets = { path = "crates/mujoco-bevy-assets" }
 
 [workspace.lints.clippy]

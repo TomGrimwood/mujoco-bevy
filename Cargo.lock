@@ -2730,8 +2730,7 @@ dependencies = [
 [[package]]
 name = "mujoco-rs"
 version = "7.1.0+mj-3.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "123f623e57c5b996d787e657bc124ef34d5405bc6546560c4b6ad3953974c8bf"
+source = "git+https://github.com/davidhozic/mujoco-rs?tag=7.1.0#f10b47f29a5f65c8a166e3c770d2844ed15c856f"
 dependencies = [
  "bytemuck",
  "log",
