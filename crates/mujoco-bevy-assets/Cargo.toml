@@ -1,0 +1,13 @@
+[package]
+name = "mujoco-bevy-assets"
+description = "A compiled MuJoCo model's meshes, textures and materials as Bevy assets"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy.workspace = true
+mujoco-rs.workspace = true

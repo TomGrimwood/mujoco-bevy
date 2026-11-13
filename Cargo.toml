@@ -1,0 +1,81 @@
+# A compiled MuJoCo model drawn in Bevy from MuJoCo's own geom list.
+# Nothing here knows about any particular kind of machine or robot.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+# Only what drawing needs: no audio, animation, glTF, scenes, UI or gamepads.
+bevy = { version = "0.20.1", default-features = false, features = [
+    "default_app",
+    "std",
+    "multi_threaded",
+    "bevy_winit",
+    "x11",
+    "wayland",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_post_process",
+    "bevy_anti_alias",
+    "bevy_gizmos_render",
+    "bevy_light",
+    "bevy_material",
+    "bevy_shader",
+    "bevy_mesh",
+    "bevy_image",
+    "bevy_camera",
+    "bevy_color",
+    "bevy_window",
+    "png",
+    "ktx2",
+    "zstd_rust",
+    "tonemapping_luts",
+] }
+bevy_egui = { version = "0.43.1", default-features = false, features = [
+    "render",
+    "default_fonts",
+    "manage_clipboard",
+    "open_url",
+] }
+egui = "0.36"
+# Stock mujoco-rs wrappers, no viewer: everything drawn here goes through
+# MuJoCo's abstract scene (mjv_*), not its OpenGL renderer. A path for now
+# (the fork's worktree beside this repo, linking the MuJoCo that
+# MUJOCO_DYNAMIC_LINK_DIR names); crates.io once the fork is retired.
+mujoco-rs = { path = "../mujoco-rs-gl-accessors", default-features = false }
+mujoco-bevy-assets = { path = "crates/mujoco-bevy-assets" }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+future_not_send = "allow"
+suboptimal_flops = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+too_many_lines = "allow"
+cast_precision_loss = "allow"
+# Bevy systems take `Res` and `Query` by value by design.
+needless_pass_by_value = "allow"
+
+# Dependencies fully optimised, the workspace's own code lightly, so plain
+# `cargo run` gives usable frame times. Line tables only: full debug info makes
+# a multi-gigabyte binary.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.dev.package.mujoco-bevy]
+opt-level = 3
+
+[profile.dev.package.mujoco-bevy-assets]
+opt-level = 3
