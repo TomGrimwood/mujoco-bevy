@@ -41,7 +41,30 @@ pub struct ModelAssets {
     materials: HashMap<MaterialKey, Handle<StandardMaterial>>,
     primitives: Option<Primitives>,
     capsules: HashMap<u32, Handle<Mesh>>,
+    /// Convex hulls by `MuJoCo` mesh id, made the first time one is drawn.
+    hulls: HashMap<usize, Handle<Mesh>>,
+    /// The size of every mesh made here, for counting what is drawn.
+    counts: HashMap<AssetId<Mesh>, MeshCounts>,
     last_rebuild: RebuildStats,
+}
+
+/// How big a Bevy mesh is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshCounts {
+    pub vertices: usize,
+    pub triangles: usize,
+}
+
+impl MeshCounts {
+    #[must_use]
+    pub fn of(mesh: &Mesh) -> Self {
+        let vertices = mesh.count_vertices();
+        let corners = mesh.indices().map_or(vertices, Indices::len);
+        Self {
+            vertices,
+            triangles: corners / 3,
+        }
+    }
 }
 
 /// What the last [`ModelAssets::rebuild`] did.
@@ -77,6 +100,21 @@ pub struct Primitives {
     pub arrow2: Handle<Mesh>,
     /// Corners at the origin, +X 1 and +Y 1, both faces.
     pub triangle: Handle<Mesh>,
+}
+
+impl Primitives {
+    fn all(&self) -> impl Iterator<Item = &Handle<Mesh>> {
+        [
+            &self.sphere,
+            &self.cuboid,
+            &self.cylinder,
+            &self.plane,
+            &self.arrow,
+            &self.arrow2,
+            &self.triangle,
+        ]
+        .into_iter()
+    }
 }
 
 /// What a geom's look is made of, quantised so near-equal looks share one
@@ -138,6 +176,39 @@ impl ModelAssets {
         self.meshes.get(id).map_or(0, |m| m.triangles)
     }
 
+    /// The size of a mesh made here (a model mesh, a primitive, a capsule or
+    /// a hull); zero for any other.
+    #[must_use]
+    pub fn counts(&self, mesh: AssetId<Mesh>) -> MeshCounts {
+        self.counts.get(&mesh).copied().unwrap_or_default()
+    }
+
+    fn add_counted(&mut self, meshes: &mut Assets<Mesh>, mesh: Mesh) -> Handle<Mesh> {
+        let counts = MeshCounts::of(&mesh);
+        let handle = meshes.add(mesh);
+        self.counts.insert(handle.id(), counts);
+        handle
+    }
+
+    /// The convex hull `MuJoCo` made of mesh `id` for collisions, as a flat
+    /// shaded mesh, built the first time it is asked for: what the convex
+    /// hull flag draws. `None` for a mesh without one (one no collision geom
+    /// uses).
+    pub fn hull(
+        &mut self,
+        model: &MjModel,
+        id: usize,
+        meshes: &mut Assets<Mesh>,
+    ) -> Option<Handle<Mesh>> {
+        if let Some(handle) = self.hulls.get(&id) {
+            return Some(handle.clone());
+        }
+        let mesh = hull_of(model, id)?;
+        let handle = self.add_counted(meshes, mesh);
+        self.hulls.insert(id, handle.clone());
+        Some(handle)
+    }
+
     /// A capsule of radius 1 whose straight part is `2 * ratio` long, for a
     /// geom scaled uniformly by its radius: a capsule cannot be scaled
     /// unevenly without squashing its ends. Ratios are bucketed on a log
@@ -146,20 +217,21 @@ impl ModelAssets {
     pub fn capsule(&mut self, meshes: &mut Assets<Mesh>, ratio: f32) -> Handle<Mesh> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let bucket = (ratio.clamp(0.0, 100.0).ln_1p() * 20.0).round() as u32;
-        self.capsules
-            .entry(bucket)
-            .or_insert_with(|| {
-                let half = (bucket as f32 / 20.0).exp_m1();
-                meshes.add(
-                    Capsule3d::new(1.0, 2.0 * half)
-                        .mesh()
-                        .longitudes(24)
-                        .latitudes(12)
-                        .build()
-                        .rotated_by(Quat::from_rotation_x(FRAC_PI_2)),
-                )
-            })
-            .clone()
+        if let Some(handle) = self.capsules.get(&bucket) {
+            return handle.clone();
+        }
+        let half = (bucket as f32 / 20.0).exp_m1();
+        let handle = self.add_counted(
+            meshes,
+            Capsule3d::new(1.0, 2.0 * half)
+                .mesh()
+                .longitudes(24)
+                .latitudes(12)
+                .build()
+                .rotated_by(Quat::from_rotation_x(FRAC_PI_2)),
+        );
+        self.capsules.insert(bucket, handle.clone());
+        handle
     }
 
     /// The material for a geom's look, made on first use.
@@ -287,8 +359,30 @@ impl ModelAssets {
             })
             .collect();
 
+        self.hulls.clear();
+        self.recount(meshes);
         stats.took = started.elapsed();
         self.last_rebuild = stats;
+    }
+
+    /// The counts of the meshes held now, and only those.
+    fn recount(&mut self, meshes: &Assets<Mesh>) {
+        let held: Vec<AssetId<Mesh>> = self
+            .meshes
+            .iter()
+            .map(|m| m.handle.id())
+            .chain(self.capsules.values().map(Handle::id))
+            .chain(self.hulls.values().map(Handle::id))
+            .chain(self.primitives.iter().flat_map(|p| p.all().map(Handle::id)))
+            .collect();
+        self.counts.retain(|id, _| held.contains(id));
+        for id in held {
+            if !self.counts.contains_key(&id)
+                && let Some(mesh) = meshes.get(id)
+            {
+                self.counts.insert(id, MeshCounts::of(mesh));
+            }
+        }
     }
 
     /// Rewrites `MuJoCo` mesh `id` from `model` under the handle it has, so
@@ -306,8 +400,12 @@ impl ModelAssets {
         slot.has_uv = built.has_uv;
         slot.vertices = built.vertices;
         slot.triangles = built.triangles;
+        let handle = slot.handle.id();
+        self.counts.insert(handle, MeshCounts::of(&mesh));
+        // Its hull is the old shape's: built again when next asked for.
+        self.hulls.remove(&id);
         // Same handle: the entities holding it need no change.
-        meshes.insert(slot.handle.id(), mesh).is_ok()
+        meshes.insert(handle, mesh).is_ok()
     }
 }
 
@@ -369,21 +467,21 @@ fn init_primitives(mut assets: ResMut<ModelAssets>, mut meshes: ResMut<Assets<Me
         vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
     )
     .with_inserted_indices(Indices::U32(vec![0, 1, 2, 0, 2, 1]));
-    assets.primitives = Some(Primitives {
-        sphere: meshes.add(Sphere::new(1.0).mesh().uv(32, 18)),
-        cuboid: meshes.add(Cuboid::new(2.0, 2.0, 2.0)),
-        cylinder: meshes.add(
-            Cylinder::new(1.0, 2.0)
-                .mesh()
-                .resolution(32)
-                .build()
-                .rotated_by(z_up),
-        ),
-        plane: meshes.add(Plane3d::new(Vec3::Z, Vec2::ONE)),
-        arrow: meshes.add(arrow(false)),
-        arrow2: meshes.add(arrow(true)),
-        triangle: meshes.add(triangle),
-    });
+    let mut add = |mesh: Mesh| assets.add_counted(&mut meshes, mesh);
+    let primitives = Primitives {
+        sphere: add(Sphere::new(1.0).mesh().uv(32, 18)),
+        cuboid: add(Cuboid::new(2.0, 2.0, 2.0).into()),
+        cylinder: add(Cylinder::new(1.0, 2.0)
+            .mesh()
+            .resolution(32)
+            .build()
+            .rotated_by(z_up)),
+        plane: add(Plane3d::new(Vec3::Z, Vec2::ONE).into()),
+        arrow: add(arrow(false)),
+        arrow2: add(arrow(true)),
+        triangle: add(triangle),
+    };
+    assets.primitives = Some(primitives);
 }
 
 /// A hash of everything a mesh is built from: its vertices, normals, texture
@@ -426,6 +524,44 @@ fn build_mesh(model: &MjModel, id: usize, meshes: &mut Assets<Mesh>) -> ModelMes
     let (mesh, mut built) = mesh_of(model, id);
     built.handle = meshes.add(mesh);
     built
+}
+
+/// Mesh `id`'s convex hull from `MuJoCo`'s graph of it: `numvert`,
+/// `numface`, then per vertex an edge address and a mesh vertex id, the
+/// edges, and per face three mesh vertex ids. Three corners per face, so
+/// each face has its own normal, as `MuJoCo`'s own renderer draws it.
+fn hull_of(model: &MjModel, id: usize) -> Option<Mesh> {
+    let at = usize::try_from(*model.mesh_graphadr().get(id)?).ok()?;
+    let graph = model.mesh_graph();
+    let numvert = to_usize(*graph.get(at)?);
+    let numface = to_usize(*graph.get(at + 1)?);
+    let faces = graph
+        .get(at + 2 + 3 * numvert + 3 * numface..)?
+        .get(..3 * numface)?;
+    let v0 = to_usize(model.mesh_vertadr()[id]);
+    let nv = to_usize(model.mesh_vertnum()[id]);
+    let verts = &model.mesh_vert()[v0..v0 + nv];
+    let (mut pos, mut nor) = (
+        Vec::with_capacity(faces.len()),
+        Vec::with_capacity(faces.len()),
+    );
+    for face in faces.as_chunks::<3>().0 {
+        let corner = |k: usize| verts.get(to_usize(face[k])).copied().map(Vec3::from_array);
+        let (a, b, c) = (corner(0)?, corner(1)?, corner(2)?);
+        let normal = (b - a).cross(c - a).normalize_or_zero().to_array();
+        pos.extend([a.to_array(), b.to_array(), c.to_array()]);
+        nor.extend([normal; 3]);
+    }
+    let indices = (0..u32::try_from(pos.len()).ok()?).collect();
+    Some(
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::RENDER_WORLD,
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, nor)
+        .with_inserted_indices(Indices::U32(indices)),
+    )
 }
 
 /// One indexed mesh, and what it holds (with a placeholder handle):
@@ -724,6 +860,31 @@ mod tests {
         assert!(
             !assets.update_mesh(&big_cube(), 1, &mut meshes),
             "no mesh 1"
+        );
+    }
+
+    #[test]
+    fn a_hull_is_built_once_with_flat_faces_and_counted() {
+        let model = cube(false);
+        let (mut assets, mut meshes) = built(&model);
+        let hull = assets
+            .hull(&model, 0, &mut meshes)
+            .expect("a collision mesh has a hull");
+        assert_eq!(assets.hull(&model, 0, &mut meshes), Some(hull.clone()));
+        assert_eq!(
+            assets.counts(hull.id()),
+            MeshCounts {
+                vertices: 36,
+                triangles: 12
+            }
+        );
+        let mesh = meshes.get(&hull).expect("the hull is in the store");
+        assert_eq!(MeshCounts::of(mesh), assets.counts(hull.id()));
+        assert_eq!(
+            assets
+                .counts(assets.mesh(0).expect("mesh 0").0.id())
+                .triangles,
+            12
         );
     }
 

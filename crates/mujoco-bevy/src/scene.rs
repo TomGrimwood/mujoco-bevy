@@ -8,13 +8,17 @@
 
 use std::ffi::CStr;
 
+use std::collections::HashSet;
+
 use bevy::ecs::system::SystemParam;
 use bevy::light::NotShadowCaster;
+use bevy::pbr::wireframe::Wireframe;
 use bevy::prelude::*;
 use mujoco_rs::prelude::*;
 
+use crate::debug::MjRenderOptions;
 use crate::{MjView, quat_from_mat};
-use mujoco_bevy_assets::{GeomLook, ModelAssets};
+use mujoco_bevy_assets::{GeomLook, MeshCounts, ModelAssets};
 
 /// A plane of size 0 is infinite in `MuJoCo`; it is drawn this far out.
 const INFINITE_PLANE: f32 = 1000.0;
@@ -30,12 +34,15 @@ pub struct Label {
 #[derive(Resource, Default)]
 pub struct Labels(pub Vec<Label>);
 
-/// What the last frame drew, for a host's panel.
+/// What the last frame drew, for a host's panel and for
+/// [`MjStatsPlugin`](crate::MjStatsPlugin)'s `mujoco/draw/*` rows. Counts of
+/// what is drawn, not timings: they change when the model or what is shown
+/// does.
 #[derive(Resource, Default, Clone)]
 pub struct GeomStats {
     /// Geoms in the scene list and the user scene.
     pub listed: usize,
-    /// Drawn as Bevy meshes.
+    /// Drawn as Bevy meshes: one entity each.
     pub surfaces: usize,
     /// Drawn as gizmo lines.
     pub lines: usize,
@@ -45,6 +52,33 @@ pub struct GeomStats {
     /// flex, SDFs.
     pub unsupported: Vec<(i32, usize)>,
     pub triangles: usize,
+    pub vertices: usize,
+    /// Distinct materials and meshes among the drawn surfaces.
+    pub materials: usize,
+    pub meshes: usize,
+    /// What each top-level body's subtree draws (its geoms and sites), by
+    /// the body's id (`body_rootid`; 0 is the world's own geoms), in id
+    /// order, subtrees that draw nothing left out.
+    pub by_subtree: Vec<(usize, DrawCounts)>,
+    /// What no body owns: frames, contacts, perturb handles, the host's
+    /// overlays.
+    pub decor: DrawCounts,
+}
+
+/// The size of what a part of the scene draws.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrawCounts {
+    pub entities: usize,
+    pub triangles: usize,
+    pub vertices: usize,
+}
+
+impl DrawCounts {
+    const fn add(&mut self, counts: MeshCounts) {
+        self.entities += 1;
+        self.triangles += counts.triangles;
+        self.vertices += counts.vertices;
+    }
 }
 
 /// Marks the entity that draws the `n`-th surface geom of the list, and says
@@ -146,9 +180,32 @@ fn kind(geom: &MjvGeom) -> Kind {
     }
 }
 
-/// Every geom drawn this frame: the scene's, then the host's overlays.
-fn geoms(view: &MjView) -> impl Iterator<Item = &MjvGeom> {
-    view.scene.geoms().iter().chain(view.user_scene.geoms())
+/// Every geom drawn this frame: the scene's, then the host's overlays,
+/// less the categories the render options hide.
+fn geoms<'a>(view: &'a MjView, options: &MjRenderOptions) -> impl Iterator<Item = &'a MjvGeom> {
+    let shown = options.category_mask();
+    view.scene
+        .geoms()
+        .iter()
+        .chain(view.user_scene.geoms())
+        .filter(move |g| g.category & shown != 0)
+}
+
+/// The top-level body whose subtree a geom belongs to, for a model geom or
+/// site; `None` for decor.
+fn owner(model: &MjModel, geom: &MjvGeom) -> Option<usize> {
+    if geom.category == MjtCatBit::mjCAT_DECOR as i32 {
+        return None;
+    }
+    let id = usize::try_from(geom.objid).ok()?;
+    let body = if geom.objtype == MjtObj::mjOBJ_GEOM as i32 {
+        *model.geom_bodyid().get(id)?
+    } else if geom.objtype == MjtObj::mjOBJ_SITE as i32 {
+        *model.site_bodyid().get(id)?
+    } else {
+        return None;
+    };
+    usize::try_from(*model.body_rootid().get(usize::try_from(body).ok()?)?).ok()
 }
 
 fn frame_of(geom: &MjvGeom, scale: Vec3) -> Transform {
@@ -166,7 +223,8 @@ pub struct Surface {
     material: Handle<StandardMaterial>,
     transform: Transform,
     casts_shadow: bool,
-    triangles: usize,
+    counts: MeshCounts,
+    owner: Option<usize>,
 }
 
 /// The stores a surface's mesh and material come from.
@@ -182,37 +240,43 @@ impl SurfaceAssets<'_> {
     /// shared unit mesh per primitive scaled by the geom's size (`MuJoCo`
     /// gives sizes as scales: radius, radius, half-length for a cylinder),
     /// the model's own mesh for a mesh geom.
-    fn surface(&mut self, geom: &MjvGeom) -> Option<Surface> {
+    fn surface(&mut self, model: &MjModel, geom: &MjvGeom) -> Option<Surface> {
         let size = Vec3::from_array(geom.size);
         let mut uv_scale = Vec2::from_array(geom.texrepeat);
         let ty = geom.type_;
         let is = |g: MjtGeom| ty == g as i32;
 
         let primitives = self.model.primitives()?;
-        let (mesh, transform, has_uv, triangles) = if is(MjtGeom::mjGEOM_MESH) {
-            // Even ids are the mesh, odd ones its convex hull; the hull is
-            // drawn as the mesh itself.
+        let (mesh, transform, has_uv) = if is(MjtGeom::mjGEOM_MESH) {
+            // Even ids are the mesh, odd ones its convex hull (the convex
+            // hull flag, on a collision geom).
             let id = usize::try_from(geom.dataid / 2).ok()?;
-            let (mesh, has_uv) = self.model.mesh(id)?;
-            let triangles = self.model.mesh_triangles(id);
-            (mesh.clone(), frame_of(geom, Vec3::ONE), has_uv, triangles)
+            let hull = if geom.dataid % 2 == 1 {
+                self.model.hull(model, id, &mut self.meshes)
+            } else {
+                None
+            };
+            let (mesh, has_uv) = match hull {
+                Some(hull) => (hull, false),
+                None => self.model.mesh(id).map(|(m, uv)| (m.clone(), uv))?,
+            };
+            (mesh, frame_of(geom, Vec3::ONE), has_uv)
         } else if is(MjtGeom::mjGEOM_SPHERE) {
             (
                 primitives.sphere.clone(),
                 frame_of(geom, Vec3::splat(size.x)),
                 true,
-                1024,
             )
         } else if is(MjtGeom::mjGEOM_ELLIPSOID) {
-            (primitives.sphere.clone(), frame_of(geom, size), true, 1024)
+            (primitives.sphere.clone(), frame_of(geom, size), true)
         } else if is(MjtGeom::mjGEOM_BOX) {
-            (primitives.cuboid.clone(), frame_of(geom, size), true, 12)
+            (primitives.cuboid.clone(), frame_of(geom, size), true)
         } else if is(MjtGeom::mjGEOM_CYLINDER) {
-            (primitives.cylinder.clone(), frame_of(geom, size), true, 128)
+            (primitives.cylinder.clone(), frame_of(geom, size), true)
         } else if is(MjtGeom::mjGEOM_CAPSULE) {
             let radius = size.x.max(1e-6);
             let mesh = self.model.capsule(&mut self.meshes, size.z / radius);
-            (mesh, frame_of(geom, Vec3::splat(radius)), true, 600)
+            (mesh, frame_of(geom, Vec3::splat(radius)), true)
         } else if is(MjtGeom::mjGEOM_PLANE) {
             let half = Vec2::new(
                 if size.x > 0.0 { size.x } else { INFINITE_PLANE },
@@ -226,18 +290,16 @@ impl SurfaceAssets<'_> {
                 primitives.plane.clone(),
                 frame_of(geom, half.extend(1.0)),
                 true,
-                2,
             )
         } else if is(MjtGeom::mjGEOM_ARROW2) {
-            (primitives.arrow2.clone(), frame_of(geom, size), true, 128)
+            (primitives.arrow2.clone(), frame_of(geom, size), true)
         } else if is(MjtGeom::mjGEOM_ARROW) || is(MjtGeom::mjGEOM_ARROW1) {
-            (primitives.arrow.clone(), frame_of(geom, size), true, 96)
+            (primitives.arrow.clone(), frame_of(geom, size), true)
         } else if is(MjtGeom::mjGEOM_TRIANGLE) {
             (
                 primitives.triangle.clone(),
                 frame_of(geom, size.with_z(1.0)),
                 true,
-                1,
             )
         } else {
             return None;
@@ -254,11 +316,12 @@ impl SurfaceAssets<'_> {
         };
         Some(Surface {
             slot: GeomSlot::of(0, geom),
+            counts: self.model.counts(mesh.id()),
             mesh,
             material: self.model.material(&mut self.materials, &look),
             transform,
             casts_shadow: geom.category != MjtCatBit::mjCAT_DECOR as i32 && geom.rgba[3] >= 0.999,
-            triangles,
+            owner: owner(model, geom),
         })
     }
 }
@@ -281,36 +344,58 @@ type Slots<'w, 's> = Query<
         &'static mut Transform,
         &'static mut Visibility,
         Has<NotShadowCaster>,
+        Has<Wireframe>,
     ),
 >;
 
+/// Scratch for counting what is drawn, kept between frames.
+#[derive(Default)]
+pub struct Tally {
+    by_body: Vec<DrawCounts>,
+    materials: HashSet<AssetId<StandardMaterial>>,
+    meshes: HashSet<AssetId<Mesh>>,
+}
+
 /// One entity per surface geom, reused in list order; slots past the end of
 /// this frame's list are hidden, not despawned.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_surfaces(
     mut commands: Commands,
     view: Res<MjView>,
+    options: Res<MjRenderOptions>,
     mut assets: SurfaceAssets,
     mut slots: Slots,
     mut stats: ResMut<GeomStats>,
     mut surfaces: Local<Vec<Surface>>,
+    mut tally: Local<Tally>,
 ) {
     surfaces.clear();
     let shown = |g: &&MjvGeom| {
         g.objtype != MjtObj::mjOBJ_GEOM as i32
             || usize::try_from(g.objid).map_or(true, |id| !view.hidden.contains(&id))
     };
+    let model = view.model();
     surfaces.extend(
-        geoms(&view)
+        geoms(&view, &options)
             .filter(|g| matches!(kind(g), Kind::Surface))
             .filter(shown)
-            .filter_map(|g| assets.surface(g)),
+            .filter_map(|g| assets.surface(model, g)),
     );
     for (index, surface) in surfaces.iter_mut().enumerate() {
         surface.slot.index = index;
+        surface.casts_shadow &= options.shadows;
     }
 
-    for (entity, mut slot, mut mesh, mut material, mut transform, mut visibility, shadowless) in
-        &mut slots
+    for (
+        entity,
+        mut slot,
+        mut mesh,
+        mut material,
+        mut transform,
+        mut visibility,
+        shadowless,
+        wireframe,
+    ) in &mut slots
     {
         let Some(surface) = surfaces.get(slot.index) else {
             visibility.set_if_neq(Visibility::Hidden);
@@ -332,6 +417,13 @@ pub fn sync_surfaces(
                 commands.entity(entity).insert(NotShadowCaster);
             }
         }
+        if wireframe != options.wireframe {
+            if options.wireframe {
+                commands.entity(entity).insert(Wireframe);
+            } else {
+                commands.entity(entity).remove::<Wireframe>();
+            }
+        }
     }
 
     let existing = slots.iter().len();
@@ -349,15 +441,56 @@ pub fn sync_surfaces(
         if !surface.casts_shadow {
             entity.insert(NotShadowCaster);
         }
+        if options.wireframe {
+            entity.insert(Wireframe);
+        }
     }
 
-    stats.surfaces = surfaces.len();
-    stats.triangles = surfaces.iter().map(|s| s.triangles).sum();
+    count_surfaces(&surfaces, view.model().nbody(), &mut tally, &mut stats);
+}
+
+fn count_surfaces(surfaces: &[Surface], nbody: i64, tally: &mut Tally, stats: &mut GeomStats) {
+    let Tally {
+        by_body,
+        materials,
+        meshes,
+    } = tally;
+    by_body.clear();
+    by_body.resize(usize::try_from(nbody).unwrap_or(0), DrawCounts::default());
+    materials.clear();
+    meshes.clear();
+    let (mut total, mut decor) = (DrawCounts::default(), DrawCounts::default());
+    for surface in surfaces {
+        total.add(surface.counts);
+        match surface.owner.and_then(|b| by_body.get_mut(b)) {
+            Some(body) => body.add(surface.counts),
+            None => decor.add(surface.counts),
+        }
+        materials.insert(surface.material.id());
+        meshes.insert(surface.mesh.id());
+    }
+    stats.surfaces = total.entities;
+    stats.triangles = total.triangles;
+    stats.vertices = total.vertices;
+    stats.materials = materials.len();
+    stats.meshes = meshes.len();
+    stats.decor = decor;
+    stats.by_subtree.clear();
+    stats.by_subtree.extend(
+        by_body
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.entities > 0)
+            .map(|(b, c)| (b, *c)),
+    );
 }
 
 /// Lines and line boxes as gizmos, redrawn each frame.
-pub fn draw_lines(view: Res<MjView>, mut gizmos: Gizmos) {
-    for geom in geoms(&view) {
+pub fn draw_lines(view: Res<MjView>, options: Res<MjRenderOptions>, mut gizmos: Gizmos) {
+    if !options.lines {
+        return;
+    }
+    for geom in geoms(&view, &options) {
         let [r, g, b, a] = geom.rgba;
         let color = Color::srgba(r, g, b, a);
         match kind(geom) {
@@ -376,11 +509,15 @@ pub fn draw_lines(view: Res<MjView>, mut gizmos: Gizmos) {
 }
 
 /// Every geom's label, for the host to draw.
-pub fn collect_labels(view: Res<MjView>, mut labels: ResMut<Labels>) {
+pub fn collect_labels(
+    view: Res<MjView>,
+    options: Res<MjRenderOptions>,
+    mut labels: ResMut<Labels>,
+) {
     labels.0.clear();
     labels
         .0
-        .extend(geoms(&view).filter(|g| g.label[0] != 0).map(|g| {
+        .extend(geoms(&view, &options).filter(|g| g.label[0] != 0).map(|g| {
             // SAFETY: `MuJoCo` writes the label NUL-terminated within its 100
             // bytes, and `mjv_initGeom` starts it empty.
             let text = unsafe { CStr::from_ptr(g.label.as_ptr()) };
@@ -392,10 +529,10 @@ pub fn collect_labels(view: Res<MjView>, mut labels: ResMut<Labels>) {
 }
 
 /// What the list holds by how it is drawn.
-pub fn count_geoms(view: Res<MjView>, mut stats: ResMut<GeomStats>) {
+pub fn count_geoms(view: Res<MjView>, options: Res<MjRenderOptions>, mut stats: ResMut<GeomStats>) {
     let (mut listed, mut lines, mut labels_only) = (0, 0, 0);
     let mut unsupported: Vec<(i32, usize)> = Vec::new();
-    for geom in geoms(&view) {
+    for geom in geoms(&view, &options) {
         listed += 1;
         match kind(geom) {
             Kind::Line | Kind::LineBox => lines += 1,

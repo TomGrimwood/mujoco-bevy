@@ -20,22 +20,32 @@
 //! [`ModelCamera`].
 
 use bevy::asset::AssetEventSystems;
+use bevy::pbr::wireframe::WireframePlugin;
 use bevy::prelude::*;
+use bevy::render::RenderApp;
 use bevy::transform::TransformSystems;
 use mujoco_rs::prelude::*;
 
 mod camera;
+pub mod debug;
 mod lights;
 mod loading;
 mod pick;
 mod scene;
+pub mod stats;
 
 pub use camera::{Click, MjCamera, ModelCamera, Modifiers, PendingClick, ViewInput};
+pub use debug::{GroupKind, MjRenderOptions, Named, VisScale};
 pub use lights::{LightSettings, MjLight};
 pub use loading::PipelinesPending;
+pub use mujoco_bevy_assets::MeshCounts;
 pub use mujoco_bevy_assets::{ModelAssets, RebuildStats};
 pub use pick::{Pick, Picked, Selection, pick};
-pub use scene::{GeomSlot, GeomStats, Label, Labels};
+pub use scene::{DrawCounts, GeomSlot, GeomStats, Label, Labels};
+pub use stats::{
+    CollisionCounts, CollisionStats, MjFigures, MjStatsInput, MjStatsPlugin, MjStatsSystems,
+    StatsSource,
+};
 
 /// How many geoms the scenes hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +93,8 @@ pub struct MjView {
     scene_ready: bool,
     /// Meshes rewritten in place, for their Bevy meshes to follow.
     meshes_rewritten: Vec<usize>,
+    /// Decor sizes the host set ([`Self::set_vis_scale`]).
+    vis_overrides: Vec<debug::VisOverride>,
 }
 
 /// What [`MjView::refresh_model`] made of a model.
@@ -118,6 +130,7 @@ impl MjView {
             generation: 0,
             scene_ready: false,
             meshes_rewritten: Vec::new(),
+            vis_overrides: Vec::new(),
         }
     }
 
@@ -129,12 +142,14 @@ impl MjView {
     pub fn set_model(&mut self, model: &MjModel) {
         let camera = self.camera.clone();
         let option = self.option.clone();
+        let overrides = std::mem::take(&mut self.vis_overrides);
         *self = Self {
             generation: self.generation + 1,
             ..Self::with_capacity(model, self.capacity)
         };
         self.camera = camera;
         self.option = option;
+        self.apply_vis_overrides(overrides);
         let tracked_gone = self.camera.type_ == MjtCamera::mjCAMERA_TRACKING as i32
             && !(0..model.nbody()).contains(&i64::from(self.camera.trackbodyid));
         let fixed_gone = self.camera.type_ == MjtCamera::mjCAMERA_FIXED as i32
@@ -150,6 +165,8 @@ impl MjView {
     /// layout is a new model.
     pub fn refresh_model(&mut self, model: &MjModel) -> Refresh {
         if self.data.try_swap_model(Box::new(model.clone())).is_ok() {
+            let overrides = std::mem::take(&mut self.vis_overrides);
+            self.apply_vis_overrides(overrides);
             Refresh::InPlace
         } else {
             self.set_model(model);
@@ -317,15 +334,24 @@ pub enum MjSystems {
 /// Draws [`MjView`].
 ///
 /// Assets, the geom list as entities, lines, labels, lights, the cameras,
-/// and picks asked for through [`PendingClick`]. Insert the resource before
-/// the first frame; frames without it draw nothing.
+/// and picks asked for through [`PendingClick`], as [`MjRenderOptions`]
+/// says. Insert the resource before the first frame; frames without it draw
+/// nothing.
+///
+/// With a renderer, it adds Bevy's `WireframePlugin` for
+/// [`MjRenderOptions::wireframe`] unless the host added it first: a host
+/// that wants it too adds it before this plugin.
 pub struct MujocoScenePlugin;
 
 impl Plugin for MujocoScenePlugin {
     fn build(&self, app: &mut App) {
         let model_changed = on_message::<ModelChanged>;
         loading::plugin(app);
+        if app.get_sub_app(RenderApp).is_some() && !app.is_plugin_added::<WireframePlugin>() {
+            app.add_plugins(WireframePlugin::default());
+        }
         app.add_plugins(mujoco_bevy_assets::MujocoAssetsPlugin)
+            .init_resource::<MjRenderOptions>()
             .init_resource::<Labels>()
             .init_resource::<GeomStats>()
             .init_resource::<LightSettings>()
@@ -368,6 +394,7 @@ impl Plugin for MujocoScenePlugin {
                         scene::draw_lines,
                         scene::collect_labels,
                         scene::count_geoms,
+                        debug::sync_fog,
                         lights::sync_lights,
                         lights::sync_ambient,
                         camera::sync_camera,

@@ -8,14 +8,19 @@
 //! failing, which is what a headless host wants.
 
 use bevy::asset::AssetPlugin;
+use bevy::diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore};
 use bevy::gizmos::GizmoPlugin;
 use bevy::input::InputPlugin;
-use bevy::light::GlobalAmbientLight;
+use bevy::light::{GlobalAmbientLight, NotShadowCaster};
 use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
+use bevy::pbr::DistanceFog;
+use bevy::pbr::wireframe::Wireframe;
 use bevy::prelude::*;
+use mujoco_bevy::stats::paths;
 use mujoco_bevy::{
-    Click, GeomSlot, Labels, LightSettings, MjCamera, MjLight, MjView, ModelCamera, Modifiers,
-    MujocoPlugin, MujocoScenePlugin, PendingClick, Picked, Refresh, Selection,
+    Click, GeomSlot, GeomStats, GroupKind, Labels, LightSettings, MjCamera, MjLight,
+    MjRenderOptions, MjStatsPlugin, MjView, ModelAssets, ModelCamera, Modifiers, MujocoPlugin,
+    MujocoScenePlugin, PendingClick, Picked, Refresh, Selection, VisScale,
 };
 use mujoco_rs::prelude::*;
 
@@ -94,7 +99,7 @@ fn app() -> App {
     app_with(MujocoPlugin)
 }
 
-fn app_with(plugin: impl Plugin) -> App {
+fn app_with<M>(plugin: impl bevy::app::Plugins<M>) -> App {
     let mut app = App::new();
     app.add_plugins((
         MinimalPlugins,
@@ -673,5 +678,321 @@ fn the_scene_plugin_works_without_the_input_plugin() {
             .as_ref()
             .and_then(|p| p.body),
         Some(body(&app, "target"))
+    );
+}
+
+// --- debug: switches, render options, stats ---
+
+fn stats_app() -> App {
+    app_with((MujocoPlugin, MjStatsPlugin::default()))
+}
+
+fn diagnostic(app: &App, path: &DiagnosticPath) -> Option<f64> {
+    app.world()
+        .resource::<DiagnosticsStore>()
+        .get(path)
+        .and_then(Diagnostic::value)
+}
+
+fn slot_of(
+    app: &mut App,
+    name: &str,
+) -> (GeomSlot, Entity, AssetId<Mesh>, Handle<StandardMaterial>) {
+    let geom = app
+        .world()
+        .resource::<MjView>()
+        .model()
+        .geom(name)
+        .expect("the geom")
+        .id;
+    slot_entities(app)
+        .into_iter()
+        .find(|(slot, ..)| slot.model_geom() == Some(geom))
+        .expect("the geom's slot")
+}
+
+fn material(app: &App, handle: &Handle<StandardMaterial>) -> StandardMaterial {
+    app.world()
+        .resource::<Assets<StandardMaterial>>()
+        .get(handle)
+        .expect("the material")
+        .clone()
+}
+
+#[test]
+fn a_vis_scale_outlives_a_new_model_and_resets_to_the_models() {
+    let mut app = app();
+    let scale = VisScale::FrameLength;
+    let own = view(&mut app).vis_scale(scale);
+    view(&mut app).set_vis_scale(scale, 3.0 * own);
+    assert!((view(&mut app).vis_scale(scale) - 3.0 * own).abs() < 1e-6);
+    view(&mut app).set_model(&model(SCENE));
+    assert!((view(&mut app).vis_scale(scale) - 3.0 * own).abs() < 1e-6);
+    assert_eq!(
+        view(&mut app).refresh_model(&model(SCENE)),
+        Refresh::InPlace
+    );
+    assert!((view(&mut app).vis_scale(scale) - 3.0 * own).abs() < 1e-6);
+    assert!((view(&mut app).model_vis_scale(scale) - own).abs() < 1e-6);
+    view(&mut app).reset_vis_scale(scale);
+    assert!((view(&mut app).vis_scale(scale) - own).abs() < 1e-6);
+    assert_eq!(view(&mut app).vis_scales_set().count(), 0);
+}
+
+#[test]
+fn groups_and_flags_go_through_the_option() {
+    let mut app = app();
+    let before = slots(&mut app).len();
+    view(&mut app).set_group(GroupKind::Geom, 0, false);
+    assert!(!view(&mut app).group(GroupKind::Geom, 0));
+    frames(&mut app, 1);
+    assert_eq!(slots(&mut app).len(), 0, "every geom is in group 0");
+    view(&mut app).set_group(GroupKind::Geom, 0, true);
+    view(&mut app).set_vis_flag(MjtVisFlag::mjVIS_STATIC, false);
+    frames(&mut app, 1);
+    assert_eq!(
+        slots(&mut app).len(),
+        before - 5,
+        "only the ball moves: the rest is welded to the world"
+    );
+}
+
+#[test]
+fn the_texture_flag_drops_the_floors_texture() {
+    let mut app = app();
+    let (.., textured) = slot_of(&mut app, "floor");
+    assert!(material(&app, &textured).base_color_texture.is_some());
+    view(&mut app).set_vis_flag(MjtVisFlag::mjVIS_TEXTURE, false);
+    frames(&mut app, 1);
+    let (.., plain) = slot_of(&mut app, "floor");
+    assert!(material(&app, &plain).base_color_texture.is_none());
+}
+
+#[test]
+fn the_transparent_flag_blends_dynamic_geoms_only() {
+    let mut app = app();
+    view(&mut app).set_vis_flag(MjtVisFlag::mjVIS_TRANSPARENT, true);
+    frames(&mut app, 1);
+    let (.., ball) = slot_of(&mut app, "ball");
+    let (.., post) = slot_of(&mut app, "post");
+    assert_eq!(material(&app, &ball).alpha_mode, AlphaMode::Blend);
+    assert_eq!(material(&app, &post).alpha_mode, AlphaMode::Opaque);
+}
+
+#[test]
+fn the_convex_hull_flag_draws_the_hull() {
+    let mut app = app();
+    let (_, entity, mesh, _) = slot_of(&mut app, "tet");
+    view(&mut app).set_vis_flag(MjtVisFlag::mjVIS_CONVEXHULL, true);
+    frames(&mut app, 1);
+    let (_, hull_entity, hull, _) = slot_of(&mut app, "tet");
+    assert_eq!(hull_entity, entity, "the same slot, another mesh");
+    assert_ne!(hull, mesh);
+    let counts = app.world().resource::<ModelAssets>().counts(hull);
+    assert_eq!((counts.triangles, counts.vertices), (4, 12));
+}
+
+#[test]
+fn render_options_reach_every_slot() {
+    let mut app = app();
+    let all = slots(&mut app).len();
+    let count = |app: &mut App, with_wireframe: bool| {
+        let mut q = app
+            .world_mut()
+            .query::<(&GeomSlot, &Visibility, Has<Wireframe>, Has<NotShadowCaster>)>();
+        q.iter(app.world())
+            .filter(|(_, v, ..)| **v != Visibility::Hidden)
+            .filter(|(_, _, w, s)| if with_wireframe { *w } else { *s })
+            .count()
+    };
+    app.world_mut().resource_mut::<MjRenderOptions>().wireframe = true;
+    app.world_mut().resource_mut::<MjRenderOptions>().shadows = false;
+    frames(&mut app, 1);
+    assert_eq!(count(&mut app, true), all);
+    assert_eq!(count(&mut app, false), all);
+
+    *app.world_mut().resource_mut::<MjRenderOptions>() = MjRenderOptions {
+        show_static: false,
+        ..default()
+    };
+    frames(&mut app, 1);
+    assert_eq!(count(&mut app, true), 0);
+    assert_eq!(slots(&mut app).len(), 1, "only the ball is dynamic");
+    let decor = MjRenderOptions {
+        show_decor: false,
+        ..default()
+    };
+    *app.world_mut().resource_mut::<MjRenderOptions>() = decor;
+    {
+        let mut view = view(&mut app);
+        // SAFETY: no material, texture or object id: plain decor.
+        unsafe {
+            view.user_scene
+                .create_geom(MjtGeom::mjGEOM_BOX, Some([0.1; 3]), None, None, None);
+        }
+    }
+    frames(&mut app, 1);
+    assert_eq!(slots(&mut app).len(), all, "the overlay is decor");
+}
+
+#[test]
+fn fog_follows_the_option_on_the_view_camera() {
+    let mut app = app();
+    let fogged = |app: &mut App| {
+        app.world_mut()
+            .query_filtered::<Has<DistanceFog>, With<MjCamera>>()
+            .single(app.world())
+            .expect("one camera")
+    };
+    assert!(!fogged(&mut app));
+    app.world_mut().resource_mut::<MjRenderOptions>().fog = true;
+    frames(&mut app, 1);
+    assert!(fogged(&mut app));
+    app.world_mut().resource_mut::<MjRenderOptions>().fog = false;
+    frames(&mut app, 1);
+    assert!(!fogged(&mut app));
+}
+
+#[test]
+fn the_timers_reach_the_views_copy_and_the_diagnostics_while_enabled() {
+    let mut app = stats_app();
+    assert!(
+        mujoco_bevy::stats::timer_armed(),
+        "armed: the rows are enabled"
+    );
+    let mut sim = MjData::new(Box::new(model(SCENE)));
+    for _ in 0..50 {
+        sim.step();
+    }
+    sim.copy_visual_to(&mut view(&mut app).data)
+        .expect("one layout");
+    assert_eq!(
+        view(&mut app).data.timer()[0].number,
+        50,
+        "mjv_copyData copies the timers"
+    );
+    frames(&mut app, 1);
+    assert_eq!(diagnostic(&app, &paths::STEPS), Some(50.0));
+    let step = diagnostic(&app, &paths::TIME[0]).expect("step time");
+    let forward = diagnostic(&app, &paths::TIME[1]).expect("forward time");
+    assert!(
+        step > 0.0 && forward > 0.0 && forward <= step,
+        "{forward} of {step} ms"
+    );
+    assert!(diagnostic(&app, &paths::PER_CALL[0]).expect("per step") * 50.0 - step < 1e-9);
+
+    for _ in 0..10 {
+        sim.step();
+    }
+    sim.copy_visual_to(&mut view(&mut app).data)
+        .expect("one layout");
+    frames(&mut app, 1);
+    assert_eq!(
+        diagnostic(&app, &paths::STEPS),
+        Some(10.0),
+        "a frame's difference"
+    );
+
+    // A new model starts its timers again.
+    view(&mut app).set_model(&model(SCENE));
+    let mut fresh = MjData::new(Box::new(model(SCENE)));
+    for _ in 0..3 {
+        fresh.step();
+    }
+    fresh
+        .copy_visual_to(&mut view(&mut app).data)
+        .expect("one layout");
+    frames(&mut app, 1);
+    assert_eq!(diagnostic(&app, &paths::STEPS), Some(3.0));
+
+    // Disabled rows disarm the clock. Here, not in a test of its own: the
+    // clock is one for the process, and the tests run side by side.
+    {
+        let mut store = app.world_mut().resource_mut::<DiagnosticsStore>();
+        for path in paths::TIME.iter().chain(&paths::PER_CALL) {
+            store.get_mut(path).expect("registered").is_enabled = false;
+        }
+    }
+    let history = |app: &App| {
+        app.world()
+            .resource::<DiagnosticsStore>()
+            .get(&paths::TIME[0])
+            .map_or(0, Diagnostic::history_len)
+    };
+    let before = history(&app);
+    frames(&mut app, 1);
+    view(&mut app).data.step();
+    frames(&mut app, 1);
+    assert_eq!(history(&app), before);
+    assert_eq!(diagnostic(&app, &paths::STEPS), Some(1.0), "counts go on");
+}
+
+#[test]
+fn draw_counts_split_by_subtree_and_follow_what_is_shown() {
+    let mut app = stats_app();
+    frames(&mut app, 1);
+    let stats = app.world().resource::<GeomStats>().clone();
+    let target = body(&app, "target");
+    let of = |stats: &GeomStats, body: usize| {
+        stats
+            .by_subtree
+            .iter()
+            .find(|(b, _)| *b == body)
+            .map(|(_, c)| *c)
+            .unwrap_or_default()
+    };
+    assert_eq!(of(&stats, target).entities, 3, "target, pin and tet");
+    assert_eq!(of(&stats, 0).entities, 1, "the floor");
+    assert_eq!(
+        stats
+            .by_subtree
+            .iter()
+            .map(|(_, c)| c.triangles)
+            .sum::<usize>()
+            + stats.decor.triangles,
+        stats.triangles
+    );
+    assert!(stats.vertices > 0 && stats.materials > 0 && stats.meshes > 0);
+    let path = DiagnosticPath::new("mujoco/draw/subtree/target/triangles");
+    let drawn = diagnostic(&app, &path).expect("a row per subtree");
+    #[allow(clippy::cast_precision_loss)]
+    let expected = of(&stats, target).triangles as f64;
+    assert!((drawn - expected).abs() < 1e-9);
+    assert_eq!(
+        diagnostic(&app, &paths::DRAW_TRIANGLES),
+        Some(stats.triangles as f64)
+    );
+
+    let ids: Vec<usize> = ["target", "pin", "tet"]
+        .iter()
+        .map(|g| view(&mut app).model().geom(g).expect("geom").id)
+        .collect();
+    view(&mut app).hidden = ids;
+    frames(&mut app, 1);
+    assert_eq!(diagnostic(&app, &path), Some(0.0));
+}
+
+#[test]
+fn collision_rows_count_colliders_and_contacts_by_subtree() {
+    let mut app = stats_app();
+    frames(&mut app, 1);
+    assert_eq!(diagnostic(&app, &paths::COLLISION_GEOMS), Some(6.0));
+    assert_eq!(diagnostic(&app, &paths::COLLISION_MESHES), Some(1.0));
+    assert_eq!(diagnostic(&app, &paths::COLLISION_HULL_VERTICES), Some(4.0));
+    let ball = DiagnosticPath::new("mujoco/collision/subtree/ball/contacts");
+    assert_eq!(diagnostic(&app, &ball), Some(0.0));
+    for _ in 0..600 {
+        view(&mut app).data.step();
+    }
+    frames(&mut app, 1);
+    let contacts = diagnostic(&app, &paths::CONTACTS).expect("contacts");
+    assert!(contacts > 0.0, "the ball rests on the floor");
+    assert_eq!(diagnostic(&app, &ball), Some(contacts));
+    assert_eq!(
+        diagnostic(
+            &app,
+            &DiagnosticPath::new("mujoco/collision/subtree/world/contacts")
+        ),
+        Some(0.0)
     );
 }
