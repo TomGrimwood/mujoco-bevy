@@ -10,12 +10,15 @@ version = "0.1.0"
 publish = false
 
 [workspace.dependencies]
-# Only what drawing needs: no audio, animation, glTF, scenes, UI or gamepads.
+# Only what drawing needs, and gamepads for the apps built on this (one
+# feature list across the repos sharing a build): no audio, animation, glTF,
+# scenes or UI.
 bevy = { version = "0.20.1", default-features = false, features = [
     "default_app",
     "std",
     "multi_threaded",
     "bevy_winit",
+    "bevy_gilrs",
     "x11",
     "wayland",
     "bevy_render",
