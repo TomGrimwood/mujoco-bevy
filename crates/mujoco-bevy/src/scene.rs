@@ -295,9 +295,14 @@ pub fn sync_surfaces(
     mut surfaces: Local<Vec<Surface>>,
 ) {
     surfaces.clear();
+    let shown = |g: &&MjvGeom| {
+        g.objtype != MjtObj::mjOBJ_GEOM as i32
+            || usize::try_from(g.objid).map_or(true, |id| !view.hidden.contains(&id))
+    };
     surfaces.extend(
         geoms(&view)
             .filter(|g| matches!(kind(g), Kind::Surface))
+            .filter(shown)
             .filter_map(|g| assets.surface(g)),
     );
     for (index, surface) in surfaces.iter_mut().enumerate() {

@@ -260,6 +260,58 @@ fn the_user_scene_is_drawn_after_the_scene() {
 }
 
 #[test]
+fn a_copied_overlay_scene_is_drawn_and_one_of_another_model_is_not() {
+    let mut app = app();
+    let before = slots(&mut app).len();
+    let mut overlays = MjvScene::new(&model(SCENE), 8);
+    // SAFETY: no material, texture or object id: plain decor.
+    unsafe {
+        overlays.create_geom(
+            MjtGeom::mjGEOM_SPHERE,
+            Some([0.2, 0.2, 0.2]),
+            Some([0.0, 2.0, 1.0]),
+            None,
+            None,
+        );
+    }
+    assert!(view(&mut app).copy_user_scene(&overlays));
+    frames(&mut app, 1);
+    let after = slots(&mut app);
+    assert_eq!(after.len(), before + 1);
+    assert_eq!(after[before].translation, Vec3::new(0.0, 2.0, 1.0));
+
+    let foreign = MjvScene::new(&model(OTHER), 8);
+    assert!(!view(&mut app).copy_user_scene(&foreign));
+    frames(&mut app, 1);
+    assert_eq!(slots(&mut app).len(), before);
+}
+
+#[test]
+fn a_hidden_geom_is_not_drawn_until_the_model_changes() {
+    let mut app = app();
+    let before = slots(&mut app).len();
+    let floor = view(&mut app)
+        .model()
+        .name_to_id(MjtObjBase::mjOBJ_GEOM, "floor")
+        .expect("floor");
+    view(&mut app).hidden.push(floor);
+    frames(&mut app, 1);
+    assert_eq!(slots(&mut app).len(), before - 1);
+    let drawn: Vec<_> = app
+        .world_mut()
+        .query::<(&GeomSlot, &Visibility)>()
+        .iter(app.world())
+        .filter(|(_, v)| **v != Visibility::Hidden)
+        .filter_map(|(s, _)| s.model_geom())
+        .collect();
+    assert!(!drawn.contains(&floor));
+
+    let scene = model(SCENE);
+    view(&mut app).set_model(&scene);
+    assert_eq!(view(&mut app).hidden, Vec::<usize>::new());
+}
+
+#[test]
 fn a_model_swap_respawns_the_slots_and_frees_the_old_assets() {
     let mut app = app();
     let swap = |app: &mut App, xml: &str| {

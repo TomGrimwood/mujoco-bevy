@@ -19,17 +19,20 @@
 //! viewport; more cameras can follow the model's own cameras through
 //! [`ModelCamera`].
 
+use bevy::asset::AssetEventSystems;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use mujoco_rs::prelude::*;
 
 mod camera;
 mod lights;
+mod loading;
 mod pick;
 mod scene;
 
 pub use camera::{Click, MjCamera, ModelCamera, Modifiers, PendingClick, ViewInput};
 pub use lights::{LightSettings, MjLight};
+pub use loading::PipelinesPending;
 pub use mujoco_bevy_assets::{ModelAssets, RebuildStats};
 pub use pick::{Pick, Picked, Selection, pick};
 pub use scene::{GeomSlot, GeomStats, Label, Labels};
@@ -71,6 +74,10 @@ pub struct MjView {
     /// simulated data (`MjvPerturb::apply`), not to [`Self::data`].
     pub perturb: MjvPerturb,
     pub camera: MjvCamera,
+    /// Model geoms left undrawn, by id: ones the host draws itself (a ground
+    /// drawn from its own texture over the model's stand-in geom). They still
+    /// take part in picks. A new model ([`Self::set_model`]) empties it.
+    pub hidden: Vec<usize>,
     capacity: Capacity,
     generation: u64,
     scene_ready: bool,
@@ -105,6 +112,7 @@ impl MjView {
             camera: MjvCamera::new_free(model),
             option: MjvOption::default(),
             perturb: MjvPerturb::default(),
+            hidden: Vec::new(),
             data,
             capacity,
             generation: 0,
@@ -226,6 +234,30 @@ impl MjView {
         true
     }
 
+    /// Takes `overlays`' geoms as this frame's [`Self::user_scene`], as many
+    /// as it holds: for a host that draws its overlays into a scene of its
+    /// own (one that exists without a view, headless too). Returns `false`,
+    /// leaving the user scene empty, when `overlays` was made for a model of
+    /// another layout: its geoms' ids would mean nothing here.
+    pub fn copy_user_scene(&mut self, overlays: &MjvScene) -> bool {
+        self.user_scene.clear_geom();
+        if !self.user_scene.is_compatible_with_scene(overlays) {
+            return false;
+        }
+        let from = overlays.ffi();
+        // SAFETY: `n` is within both scenes' geom buffers (each holds
+        // `maxgeom`); the scenes are different allocations; an `mjvGeom` is
+        // plain data, and both scenes were made for one model layout, so the
+        // copied ids index the same arrays.
+        unsafe {
+            let to = self.user_scene.ffi_mut();
+            let n = from.ngeom.min(to.maxgeom).max(0);
+            std::ptr::copy_nonoverlapping(from.geoms, to.geoms, usize::try_from(n).unwrap_or(0));
+            to.ngeom = n;
+        }
+        true
+    }
+
     /// The view's own copy of the model.
     #[must_use]
     pub fn model(&self) -> &MjModel {
@@ -292,6 +324,7 @@ pub struct MujocoScenePlugin;
 impl Plugin for MujocoScenePlugin {
     fn build(&self, app: &mut App) {
         let model_changed = on_message::<ModelChanged>;
+        loading::plugin(app);
         app.add_plugins(mujoco_bevy_assets::MujocoAssetsPlugin)
             .init_resource::<Labels>()
             .init_resource::<GeomStats>()
@@ -305,7 +338,13 @@ impl Plugin for MujocoScenePlugin {
                 (MjSystems::Scene, MjSystems::Draw)
                     .chain()
                     .run_if(resource_exists::<MjView>)
-                    .before(TransformSystems::Propagate),
+                    .before(TransformSystems::Propagate)
+                    // Meshes, images and materials made or rewritten here are
+                    // announced the same frame, so the render world extracts
+                    // them once, from this frame's data. After the flush, a
+                    // rewritten mesh was announced a frame late and its
+                    // render-world-only data taken twice.
+                    .before(AssetEventSystems),
             )
             .add_systems(
                 PostUpdate,
