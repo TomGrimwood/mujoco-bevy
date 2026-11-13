@@ -44,6 +44,7 @@
 //! from frame to frame, and a figure that went down is taken as a fresh
 //! start.
 
+use crate::DrawCounts;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -434,9 +435,10 @@ fn hull_vertices(model: &MjModel, mesh: i32) -> usize {
         .map_or_else(|| to_usize(model.mesh_vertnum()[mesh]), to_usize)
 }
 
-/// A subtree's name in diagnostic paths: its root body's name with empty
-/// parts dropped (`m0/base` stays `m0/base`), `world` for the world body,
-/// `body<id>` for a body without a name.
+/// A subtree's name in diagnostic paths: the first `/`-separated part of its
+/// root body's name, so every top-level body of one attached model (`m0/base`,
+/// `m0/track_shoe_3`: one machine) counts as one subtree, `m0`; `world` for the
+/// world body; `body<id>` for a body without a name.
 #[must_use]
 pub fn subtree_name(model: &MjModel, body: usize) -> String {
     if body == 0 {
@@ -445,12 +447,9 @@ pub fn subtree_name(model: &MjModel, body: usize) -> String {
     let name = model
         .id_to_name(MjtObjBase::mjOBJ_BODY, body)
         .unwrap_or_default();
-    let parts: Vec<&str> = name.split('/').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        format!("body{body}")
-    } else {
-        parts.join("/")
-    }
+    name.split('/')
+        .find(|p| !p.is_empty())
+        .map_or_else(|| format!("body{body}"), str::to_owned)
 }
 
 /// Where the figures come from.
@@ -572,7 +571,8 @@ fn read_view(view: Res<MjView>, mut input: ResMut<MjStatsInput>) {
 
 /// One subtree's diagnostic paths.
 struct SubtreePaths {
-    body: usize,
+    /// The top-level bodies sharing this subtree's name.
+    bodies: Vec<usize>,
     draw: [DiagnosticPath; 3],
     collision: [DiagnosticPath; 6],
 }
@@ -601,15 +601,22 @@ fn subtrees(
     let model = view.model();
     *collision = CollisionStats::of_model(model);
     let rootid = model.body_rootid();
-    subtrees.paths = (0..to_usize(model.nbody()))
-        .filter(|&b| to_usize(rootid[b]) == b)
-        .map(|body| {
-            let name = subtree_name(model, body);
+    let mut named: Vec<(String, Vec<usize>)> = Vec::new();
+    for body in (0..to_usize(model.nbody())).filter(|&b| to_usize(rootid[b]) == b) {
+        let name = subtree_name(model, body);
+        match named.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, bodies)) => bodies.push(body),
+            None => named.push((name, vec![body])),
+        }
+    }
+    subtrees.paths = named
+        .into_iter()
+        .map(|(name, bodies)| {
             let path = |kind: &str, what: &str| {
                 DiagnosticPath::new(format!("mujoco/{kind}/subtree/{name}/{what}"))
             };
             SubtreePaths {
-                body,
+                bodies,
                 draw: paths::SUBTREE_DRAW.map(|w| path("draw", w)),
                 collision: paths::SUBTREE_COLLISION.map(|w| path("collision", w)),
             }
@@ -716,9 +723,12 @@ fn publish(
             let counts = geoms
                 .by_subtree
                 .iter()
-                .find(|(b, _)| *b == subtree.body)
-                .map(|(_, c)| *c)
-                .unwrap_or_default();
+                .filter(|(b, _)| subtree.bodies.contains(b))
+                .fold(DrawCounts::default(), |a, (_, c)| DrawCounts {
+                    entities: a.entities + c.entities,
+                    triangles: a.triangles + c.triangles,
+                    vertices: a.vertices + c.vertices,
+                });
             for (path, value) in
                 subtree
                     .draw
@@ -740,9 +750,15 @@ fn publish(
         let c = collision
             .by_subtree
             .iter()
-            .find(|(b, _)| *b == subtree.body)
-            .map(|(_, c)| *c)
-            .unwrap_or_default();
+            .filter(|(b, _)| subtree.bodies.contains(b))
+            .fold(CollisionCounts::default(), |a, (_, c)| CollisionCounts {
+                geoms: a.geoms + c.geoms,
+                primitives: a.primitives + c.primitives,
+                meshes: a.meshes + c.meshes,
+                other: a.other + c.other,
+                hull_vertices: a.hull_vertices + c.hull_vertices,
+                contacts: a.contacts + c.contacts,
+            });
         for (path, value) in subtree.collision.iter().zip([
             c.geoms,
             c.primitives,
@@ -831,7 +847,7 @@ mod tests {
             (2, 1, 1, 4)
         );
         assert_eq!(of(id("m1/")).geoms, 1);
-        assert_eq!(subtree_name(&model, id("m0/base")), "m0/base");
+        assert_eq!(subtree_name(&model, id("m0/base")), "m0");
         assert_eq!(subtree_name(&model, id("m1/")), "m1");
         assert_eq!(subtree_name(&model, 0), "world");
     }
