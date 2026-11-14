@@ -18,6 +18,10 @@ pub struct LightSettings {
     pub lumens_per_diffuse: f32,
     /// Ambient brightness for an ambient sum of 1.
     pub ambient_per_unit: f32,
+    /// The lights that cast no shadow: fill lights and the headlight, which
+    /// stand in for the sky in `MuJoCo`'s own renderer. A host that lights
+    /// the scene from an environment map leaves them out.
+    pub fill: bool,
 }
 
 impl Default for LightSettings {
@@ -27,6 +31,7 @@ impl Default for LightSettings {
             lux_per_diffuse: 30_000.0,
             lumens_per_diffuse: 2_000_000.0,
             ambient_per_unit: 2_000.0,
+            fill: true,
         }
     }
 }
@@ -183,6 +188,7 @@ pub fn sync_lights(
         .scene
         .lights()
         .iter()
+        .filter(|l| settings.fill || l.castshadow != 0)
         .map(|l| Wanted::new(l, &settings))
         .collect();
     let same_set = lights.iter().len() == wanted.len()
