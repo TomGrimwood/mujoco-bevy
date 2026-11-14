@@ -12,6 +12,10 @@
 //! (wireframe, fog) and [`LightSettings`](crate::LightSettings) (shadows),
 //! with a few isolations of Bevy's own: geom categories, shadow casting,
 //! gizmo lines.
+//!
+//! The physics option (`MjModel::opt`) has names too, for a panel that
+//! edits it: [`DISABLE_FLAGS`], [`ENABLE_FLAGS`], [`INTEGRATORS`],
+//! [`CONES`], [`JACOBIANS`], [`SOLVERS`].
 
 use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
@@ -190,6 +194,54 @@ impl GroupKind {
         }
     }
 }
+
+/// `mjtDisableBit` as `MuJoCo`'s viewer names them: entry `k` is bit
+/// `1 << k` of `MjOption::disableflags`.
+pub const DISABLE_FLAGS: [&str; MjtDisableBit::mjNDISABLE as usize] = [
+    "Constraint",
+    "Equality",
+    "Frictionloss",
+    "Limit",
+    "Contact",
+    "Spring",
+    "Damper",
+    "Gravity",
+    "Clampctrl",
+    "Warmstart",
+    "Filterparent",
+    "Actuation",
+    "Refsafe",
+    "Sensor",
+    "Midphase",
+    "Eulerdamp",
+    "AutoReset",
+    "NativeCCD",
+    "Island",
+    "MultiCCD",
+];
+
+/// `mjtEnableBit`: entry `k` is bit `1 << k` of `MjOption::enableflags`.
+pub const ENABLE_FLAGS: [&str; MjtEnableBit::mjNENABLE as usize] = [
+    "Override",
+    "Energy",
+    "Fwdinv",
+    "InvDiscrete",
+    "Sleep",
+    "DiagExact",
+    "IPC",
+];
+
+/// `mjtIntegrator`, for `MjOption::integrator`: entry `k` is value `k`.
+pub const INTEGRATORS: [&str; 5] = ["Euler", "RK4", "implicit", "implicitfast", "discrete"];
+
+/// `mjtCone`, for `MjOption::cone`.
+pub const CONES: [&str; 2] = ["Pyramidal", "Elliptic"];
+
+/// `mjtJacobian`, for `MjOption::jacobian`.
+pub const JACOBIANS: [&str; 3] = ["Dense", "Sparse", "Auto"];
+
+/// `mjtSolver`, for `MjOption::solver`.
+pub const SOLVERS: [&str; 3] = ["PGS", "CG", "Newton"];
 
 /// A size or scale in the model's `vis` that decor is drawn with. Sizes are
 /// fractions of the model's mean body size (`stat.meansize`); the map
@@ -537,6 +589,25 @@ mod tests {
             assert_eq!(f.value as usize, k);
             assert_eq!(f.name, c_name(frame[k]));
         }
+    }
+
+    #[test]
+    fn the_physics_flags_are_named_as_mujoco_names_them() {
+        // SAFETY: reads of `MuJoCo`'s constant string tables.
+        let (disable, enable) = unsafe { (mujoco_c::mjDISABLESTRING, mujoco_c::mjENABLESTRING) };
+        for (k, name) in DISABLE_FLAGS.iter().enumerate() {
+            assert_eq!(*name, c_name(disable[k]));
+        }
+        for (k, name) in ENABLE_FLAGS.iter().enumerate() {
+            assert_eq!(*name, c_name(enable[k]));
+        }
+        assert_eq!(
+            MjtIntegrator::mjINT_DISCRETE as usize,
+            INTEGRATORS.len() - 1
+        );
+        assert_eq!(MjtCone::mjCONE_ELLIPTIC as usize, CONES.len() - 1);
+        assert_eq!(MjtJacobian::mjJAC_AUTO as usize, JACOBIANS.len() - 1);
+        assert_eq!(MjtSolver::mjSOL_NEWTON as usize, SOLVERS.len() - 1);
     }
 
     #[test]
