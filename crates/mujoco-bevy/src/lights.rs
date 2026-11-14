@@ -113,13 +113,15 @@ impl Wanted {
     }
 }
 
-/// Cascades for a work area about 50 m across: fine near the camera, out to
-/// where a machine is still large on screen.
+/// Cascades for a work area about 50 m across: one over what the camera
+/// usually orbits at, a machine and the ground round it, and one beyond,
+/// out to where a machine is still large on screen. Two, not Bevy's four:
+/// every cascade is the scene drawn again into the shadow map.
 fn cascades() -> CascadeShadowConfig {
     CascadeShadowConfigBuilder {
-        num_cascades: 4,
+        num_cascades: 2,
         minimum_distance: 0.1,
-        first_cascade_far_bound: 6.0,
+        first_cascade_far_bound: 16.0,
         maximum_distance: 60.0,
         overlap_proportion: 0.2,
     }
