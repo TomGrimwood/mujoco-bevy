@@ -310,6 +310,10 @@ impl SurfaceAssets<'_> {
             emission: geom.emission,
             specular: geom.specular,
             shininess: geom.shininess,
+            pbr: usize::try_from(geom.matid)
+                .ok()
+                .filter(|&m| m < model.mat_metallic().len())
+                .map(|m| [model.mat_metallic()[m], model.mat_roughness()[m]]),
             // A texture on a mesh without coordinates would not draw at all.
             texture: self.model.texture(geom.texid).filter(|_| has_uv),
             uv_scale,

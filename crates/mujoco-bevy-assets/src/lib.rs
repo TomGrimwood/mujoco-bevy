@@ -126,6 +126,8 @@ struct MaterialKey {
     emission: u8,
     specular: u8,
     shininess: u8,
+    /// `metallic` and `roughness`, 255 for one left unset.
+    pbr: [u8; 2],
     uv_scale: [u32; 2],
 }
 
@@ -135,6 +137,10 @@ pub struct GeomLook {
     pub emission: f32,
     pub specular: f32,
     pub shininess: f32,
+    /// The material's `metallic` and `roughness`, which `MuJoCo` carries for
+    /// a physically based renderer and leaves negative when the MJCF sets
+    /// neither; `None` for a geom with no material.
+    pub pbr: Option<[f32; 2]>,
     /// A 2D texture of the model, already checked to exist.
     pub texture: Option<usize>,
     pub uv_scale: Vec2,
@@ -251,6 +257,10 @@ impl ModelAssets {
             emission: q(look.emission),
             specular: q(look.specular),
             shininess: q(look.shininess),
+            pbr: look
+                .pbr
+                .filter(|pbr| pbr.iter().any(|&x| x >= 0.0))
+                .map_or([255; 2], |pbr| pbr.map(|x| q(x).min(254))),
             uv_scale: [look.uv_scale.x.to_bits(), look.uv_scale.y.to_bits()],
         };
         if let Some(handle) = self.materials.get(&key) {
@@ -265,6 +275,29 @@ impl ModelAssets {
         // down by about a thousand, where `MuJoCo`'s is a fraction of the
         // colour; this makes emission 1 about as bright as a sunlit face.
         let emissive = LinearRgba::from(Color::srgb(r, g, b)) * (look.emission * 1000.0);
+        // A material that says what it is made of is drawn as that. One that
+        // does not, by eye: `MuJoCo`'s Phong shininess and specular weight
+        // to a roughness and a reflectance that look about as glossy.
+        let said = key.pbr != [255; 2];
+        let [metallic, roughness] = look.pbr.unwrap_or_default();
+        let (metallic, perceptual_roughness, reflectance) = if said {
+            (
+                metallic.clamp(0.0, 1.0),
+                // Bevy's floor: a mirror aliases under a sun.
+                if roughness < 0.0 {
+                    0.5
+                } else {
+                    roughness.clamp(0.045, 1.0)
+                },
+                StandardMaterial::default().reflectance,
+            )
+        } else {
+            (
+                0.0,
+                (1.0 - 0.75 * look.shininess).clamp(0.25, 1.0),
+                (0.15 + 0.7 * look.specular).clamp(0.0, 1.0),
+            )
+        };
         let material = StandardMaterial {
             base_color: base,
             base_color_texture: look
@@ -272,10 +305,9 @@ impl ModelAssets {
                 .and_then(|t| self.textures.get(t).cloned().flatten()),
             uv_transform: Affine2::from_scale(look.uv_scale),
             emissive,
-            // By eye: `MuJoCo`'s Phong shininess and specular weight to a
-            // roughness and a reflectance that look about as glossy.
-            perceptual_roughness: (1.0 - 0.75 * look.shininess).clamp(0.25, 1.0),
-            reflectance: (0.15 + 0.7 * look.specular).clamp(0.0, 1.0),
+            metallic,
+            perceptual_roughness,
+            reflectance,
             alpha_mode: if a < 0.999 {
                 AlphaMode::Blend
             } else {
