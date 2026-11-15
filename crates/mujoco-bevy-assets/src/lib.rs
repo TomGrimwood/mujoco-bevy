@@ -229,7 +229,7 @@ impl ModelAssets {
     /// every frame, and even buckets made a mesh for each new length.
     pub fn capsule(&mut self, meshes: &mut Assets<Mesh>, ratio: f32) -> Handle<Mesh> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let bucket = (ratio.clamp(0.0, 100.0).ln_1p() * 20.0).round() as u32;
+        let bucket = (ratio.clamp(0.0, 10_000.0).ln_1p() * 20.0).round() as u32;
         if let Some(handle) = self.capsules.get(&bucket) {
             return handle.clone();
         }
