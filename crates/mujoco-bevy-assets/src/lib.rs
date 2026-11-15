@@ -22,6 +22,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use mujoco_rs::prelude::*;
 
+pub mod shape;
+
 /// Past this many cached materials the cache starts again: geoms that change
 /// colour every frame (activation colours, a fading highlight) would
 /// otherwise grow it without end.
@@ -679,23 +681,34 @@ fn mesh_of(model: &MjModel, id: usize) -> (Mesh, ModelMesh) {
             indices.push(index);
         }
     }
-    let vertices = pos.len();
     let has_uv = !uv.is_empty();
-    let mut mesh = Mesh::new(
+    let shape = shape::distances(shape::Corners {
+        pos: &mut pos,
+        nor: &mut nor,
+        uv: &mut uv,
+        indices: &mut indices,
+    });
+    let (vertices, triangles) = (pos.len(), indices.len() / 3);
+    // Bevy's fragment shader takes a second set of coordinates to need a
+    // first.
+    let uv = if has_uv { uv } else { vec![[0.0f32; 2]; vertices] };
+    let mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, nor)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uv)
+    // Each corner's distance to the nearest outside edge and inside
+    // corner ([`shape`]), for a material that weathers; Bevy's standard
+    // material reads a second set only for a lightmap or a texture told to.
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, shape)
     .with_inserted_indices(Indices::U32(indices));
-    if has_uv {
-        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv);
-    }
     let built = ModelMesh {
         handle: Handle::default(),
         has_uv,
         vertices,
-        triangles: nf,
+        triangles,
     };
     (mesh, built)
 }
