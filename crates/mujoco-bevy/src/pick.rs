@@ -4,8 +4,12 @@
 use bevy::math::DVec3;
 use bevy::prelude::*;
 
-use crate::MjView;
 use crate::camera::{Click, Modifiers, PendingClick};
+use crate::{MjBody, MjView};
+
+/// The geom group of colliders: what a click finds a body by when its
+/// visuals are drawn apart from the model ([`crate::MjLook`]).
+const COLLIDER_GROUP: usize = 3;
 
 /// What a click hit.
 #[derive(Clone, Debug)]
@@ -37,17 +41,27 @@ pub fn forget_selection(mut selection: ResMut<Selection>) {
 
 /// Casts the ray for this frame's click, if there was one, and reports it.
 /// An unmodified click also selects what it hit, as `simulate` does: the body
-/// becomes the perturb's selection.
+/// becomes the perturb's selection. While bodies are drawn from looks, the
+/// ray meets their colliders: the model has no visual geoms to meet.
 pub fn pick_clicked(
     mut view: ResMut<MjView>,
     mut pending: ResMut<PendingClick>,
     mut selection: ResMut<Selection>,
     mut picked: MessageWriter<Picked>,
+    looks: Query<(), With<MjBody>>,
 ) {
     let Some(click) = pending.0.take() else {
         return;
     };
-    let pick = pick(&mut view, click);
+    let pick = if looks.is_empty() {
+        pick(&mut view, click)
+    } else {
+        let shown = view.option.geomgroup[COLLIDER_GROUP];
+        view.option.geomgroup[COLLIDER_GROUP] = 1;
+        let pick = pick(&mut view, click);
+        view.option.geomgroup[COLLIDER_GROUP] = shown;
+        pick
+    };
     if click.modifiers.any() {
         picked.write(Picked {
             pick,

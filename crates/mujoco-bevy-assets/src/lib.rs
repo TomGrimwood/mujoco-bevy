@@ -274,52 +274,10 @@ impl ModelAssets {
         if self.materials.len() >= MATERIAL_CACHE_CAP {
             self.materials.clear();
         }
-        let [r, g, b, a] = look.rgba;
-        let base = Color::srgba(r, g, b, a);
-        // Bevy's emissive is a luminance that the camera's exposure scales
-        // down by about a thousand, where `MuJoCo`'s is a fraction of the
-        // colour; this makes emission 1 about as bright as a sunlit face.
-        let emissive = LinearRgba::from(Color::srgb(r, g, b)) * (look.emission * 1000.0);
-        // A material that says what it is made of is drawn as that. One that
-        // does not, by eye: `MuJoCo`'s Phong shininess and specular weight
-        // to a roughness and a reflectance that look about as glossy.
-        let said = key.pbr != [255; 2];
-        let [metallic, roughness] = look.pbr.unwrap_or_default();
-        let (metallic, perceptual_roughness, reflectance) = if said {
-            (
-                metallic.clamp(0.0, 1.0),
-                // Bevy's floor: a mirror aliases under a sun.
-                if roughness < 0.0 {
-                    0.5
-                } else {
-                    roughness.clamp(0.045, 1.0)
-                },
-                StandardMaterial::default().reflectance,
-            )
-        } else {
-            (
-                0.0,
-                (1.0 - 0.75 * look.shininess).clamp(0.25, 1.0),
-                (0.15 + 0.7 * look.specular).clamp(0.0, 1.0),
-            )
-        };
-        let material = StandardMaterial {
-            base_color: base,
-            base_color_texture: look
-                .texture
-                .and_then(|t| self.textures.get(t).cloned().flatten()),
-            uv_transform: Affine2::from_scale(look.uv_scale),
-            emissive,
-            metallic,
-            perceptual_roughness,
-            reflectance,
-            alpha_mode: if a < 0.999 {
-                AlphaMode::Blend
-            } else {
-                AlphaMode::Opaque
-            },
-            ..default()
-        };
+        let texture = look
+            .texture
+            .and_then(|t| self.textures.get(t).cloned().flatten());
+        let material = standard_material(look, texture, false);
         let handle = materials.add(material);
         self.materials.insert(key, handle.clone());
         handle
@@ -631,6 +589,64 @@ fn hull_of(model: &MjModel, id: usize) -> Option<Mesh> {
     )
 }
 
+/// The material `MuJoCo`'s look of a geom stands for, drawing `texture`.
+/// A `cutout` texture (texels below half alpha: a decal on a quad) is drawn
+/// alpha-tested, so only the decal's outline shows; `MuJoCo`'s own renderer
+/// draws the quad whole.
+#[must_use]
+pub fn standard_material(
+    look: &GeomLook,
+    texture: Option<Handle<Image>>,
+    cutout: bool,
+) -> StandardMaterial {
+    let [r, g, b, a] = look.rgba;
+    let base = Color::srgba(r, g, b, a);
+    // Bevy's emissive is a luminance that the camera's exposure scales
+    // down by about a thousand, where `MuJoCo`'s is a fraction of the
+    // colour; this makes emission 1 about as bright as a sunlit face.
+    let emissive = LinearRgba::from(Color::srgb(r, g, b)) * (look.emission * 1000.0);
+    // A material that says what it is made of is drawn as that. One that
+    // does not, by eye: `MuJoCo`'s Phong shininess and specular weight
+    // to a roughness and a reflectance that look about as glossy.
+    let said = look.pbr.is_some_and(|pbr| pbr.iter().any(|&x| x >= 0.0));
+    let [metallic, roughness] = look.pbr.unwrap_or_default();
+    let (metallic, perceptual_roughness, reflectance) = if said {
+        (
+            metallic.clamp(0.0, 1.0),
+            // Bevy's floor: a mirror aliases under a sun.
+            if roughness < 0.0 {
+                0.5
+            } else {
+                roughness.clamp(0.045, 1.0)
+            },
+            StandardMaterial::default().reflectance,
+        )
+    } else {
+        (
+            0.0,
+            (1.0 - 0.75 * look.shininess).clamp(0.25, 1.0),
+            (0.15 + 0.7 * look.specular).clamp(0.0, 1.0),
+        )
+    };
+    StandardMaterial {
+        base_color: base,
+        base_color_texture: texture,
+        uv_transform: Affine2::from_scale(look.uv_scale),
+        emissive,
+        metallic,
+        perceptual_roughness,
+        reflectance,
+        alpha_mode: if a < 0.999 {
+            AlphaMode::Blend
+        } else if cutout {
+            AlphaMode::Mask(0.5)
+        } else {
+            AlphaMode::Opaque
+        },
+        ..default()
+    }
+}
+
 /// One indexed mesh, and what it holds (with a placeholder handle):
 /// `MuJoCo` indexes positions, normals and texture coordinates apart, so
 /// corners that agree on all three are merged.
@@ -682,6 +698,55 @@ fn mesh_of(model: &MjModel, id: usize) -> (Mesh, ModelMesh) {
         triangles: nf,
     };
     (mesh, built)
+}
+
+/// A model mesh built as a Bevy mesh, not yet added to the assets.
+pub struct BuiltMesh {
+    pub mesh: Mesh,
+    /// Whether it has texture coordinates: a texture on a mesh without
+    /// them would not draw at all.
+    pub has_uv: bool,
+    pub counts: MeshCounts,
+}
+
+/// `MuJoCo` mesh `id` of `model` as a Bevy mesh: slow for a big mesh, so it
+/// may run off the main thread.
+#[must_use]
+pub fn build_model_mesh(model: &MjModel, id: usize) -> BuiltMesh {
+    let (mesh, built) = mesh_of(model, id);
+    BuiltMesh {
+        mesh,
+        has_uv: built.has_uv,
+        counts: MeshCounts {
+            vertices: built.vertices,
+            triangles: built.triangles,
+        },
+    }
+}
+
+/// A model texture built as a Bevy image, not yet added to the assets.
+pub struct BuiltTexture {
+    pub image: Image,
+    /// Some texels are below half alpha: drawn alpha-tested
+    /// ([`standard_material`]).
+    pub cutout: bool,
+    /// Its mean colour as stored: what a wire of a geom drawing it is
+    /// drawn in.
+    pub tint: [f32; 3],
+}
+
+/// 2D texture `id` of `model` as a Bevy image with its mips; `None` for a
+/// texture of another kind. May run off the main thread.
+#[must_use]
+pub fn build_model_texture(model: &MjModel, id: usize) -> Option<BuiltTexture> {
+    let source = decode_texture(model, id)?;
+    let cutout = source.rgba.as_chunks::<4>().0.iter().any(|t| t[3] < 128);
+    let tint = mean_colour(&source.rgba);
+    Some(BuiltTexture {
+        image: build_texture(source),
+        cutout,
+        tint,
+    })
 }
 
 /// A 2D texture's pixels as RGBA, and its size and colour space.

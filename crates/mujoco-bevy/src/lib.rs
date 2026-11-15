@@ -33,6 +33,7 @@ mod loading;
 mod pick;
 mod scene;
 pub mod stats;
+mod visual;
 
 pub use camera::{Click, MjCamera, ModelCamera, Modifiers, PendingClick, ViewInput};
 pub use debug::{GroupKind, MjRenderOptions, Named, VisScale};
@@ -45,6 +46,10 @@ pub use scene::{DrawCounts, GeomSlot, GeomStats, Label, Labels};
 pub use stats::{
     CollisionCounts, CollisionStats, MjFigures, MjStatsInput, MjStatsPlugin, MjStatsSystems,
     StatsSource,
+};
+pub use visual::{
+    MjBody, MjHiddenGeom, MjLook, MjLookVisuals, MjVisualGeom, MjVisuals, VisualPart, Visuals,
+    VisualsOf, VisualsSpawned,
 };
 
 /// How many geoms the scenes hold.
@@ -347,6 +352,7 @@ impl Plugin for MujocoScenePlugin {
     fn build(&self, app: &mut App) {
         let model_changed = on_message::<ModelChanged>;
         loading::plugin(app);
+        visual::plugin(app);
         if app.get_sub_app(RenderApp).is_some() && !app.is_plugin_added::<WireframePlugin>() {
             app.add_plugins(WireframePlugin::default());
         }
