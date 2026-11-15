@@ -819,11 +819,12 @@ fn decode_texture(model: &MjModel, id: usize) -> Option<TextureSource> {
         1 => bytes.iter().flat_map(|&l| [l, l, l, 255]).collect(),
         _ => return None,
     };
-    let format = if model.tex_colorspace()[id] == MjtColorSpace::mjCOLORSPACE_LINEAR {
-        TextureFormat::Rgba8Unorm
-    } else {
-        TextureFormat::Rgba8UnormSrgb
-    };
+    // A model texture is a colour (a material's base colour, all this
+    // crate draws with), as the screen shows it: `MuJoCo`'s renderer puts
+    // its bytes on the screen as they are. Its `colorspace="auto"` reads a
+    // PNG without an sRGB chunk as linear, and taken at its word a texture
+    // came out pale and washed toward yellow (Hitachi orange as amber).
+    let format = TextureFormat::Rgba8UnormSrgb;
     Some(TextureSource {
         rgba,
         width: w,
@@ -848,8 +849,8 @@ pub fn repeating_image(rgba: Vec<u8>, width: u32, height: u32, linear: bool) -> 
     })
 }
 
-/// An sRGB (or linear, if the model says so) RGBA image with a full mip
-/// chain, repeating, as `MuJoCo` samples it.
+/// An RGBA image (sRGB colour, or linear data) with a full mip chain,
+/// repeating, as `MuJoCo` samples it.
 fn build_texture(source: TextureSource) -> Image {
     let TextureSource {
         rgba,
