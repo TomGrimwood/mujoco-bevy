@@ -434,9 +434,11 @@ impl MjView {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MjRenderOptions {
-    /// Bevy's [`Wireframe`](bevy::pbr::wireframe::Wireframe) on every
-    /// geom: edges drawn over the shaded surfaces in a pass of their own
-    /// (polygon mode line). Needs `WireframePlugin`, which the scene plugin
+    /// Every geom as its wires alone, each in the geom's colour (its
+    /// texture's mean, for a textured one), as `MuJoCo`'s own wireframe:
+    /// Bevy's [`Wireframe`](bevy::pbr::wireframe::Wireframe) in a pass of
+    /// its own (polygon mode line), the geom's material one that draws
+    /// nothing. Needs `WireframePlugin`, which the scene plugin
     /// adds when there is a renderer, and the GPU features
     /// `POLYGON_MODE_LINE | IMMEDIATES` (Vulkan, DX12, Metal; Bevy logs a
     /// warning and draws none without them). Costs about one more draw of

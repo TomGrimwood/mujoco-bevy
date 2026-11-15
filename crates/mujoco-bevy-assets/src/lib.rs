@@ -34,6 +34,11 @@ const MATERIAL_CACHE_CAP: usize = 4096;
 pub struct ModelAssets {
     meshes: Vec<ModelMesh>,
     textures: Vec<Option<Handle<Image>>>,
+    /// Each texture's mean colour, as stored: what a wire of a textured
+    /// geom is drawn in.
+    tints: Vec<Option<[f32; 3]>>,
+    /// A material that draws nothing: a geom shown as its wires alone.
+    hidden: Option<Handle<StandardMaterial>>,
     /// The meshes and textures of the current model by content, for the next
     /// rebuild to reuse.
     mesh_by_content: HashMap<u64, ModelMesh>,
@@ -320,6 +325,32 @@ impl ModelAssets {
         handle
     }
 
+    /// The mean colour of texture `id`, as its texels are stored (sRGB for
+    /// a colour map).
+    #[must_use]
+    pub fn texture_tint(&self, id: usize) -> Option<[f32; 3]> {
+        self.tints.get(id).copied().flatten()
+    }
+
+    /// A material that draws nothing and casts no shadow (every fragment
+    /// masked out): for a geom shown as its wires alone, which Bevy draws
+    /// apart from the material.
+    pub fn hidden_material(
+        &mut self,
+        materials: &mut Assets<StandardMaterial>,
+    ) -> Handle<StandardMaterial> {
+        self.hidden
+            .get_or_insert_with(|| {
+                materials.add(StandardMaterial {
+                    base_color: Color::NONE,
+                    alpha_mode: AlphaMode::Mask(0.5),
+                    unlit: true,
+                    ..default()
+                })
+            })
+            .clone()
+    }
+
     /// Materials cached now, to show that a model swap lets go of them.
     #[must_use]
     pub fn material_count(&self) -> usize {
@@ -371,9 +402,12 @@ impl ModelAssets {
             .collect();
 
         let mut before = std::mem::take(&mut self.texture_by_content);
+        let mut tints = Vec::new();
         self.textures = (0..to_usize(model.ntex()))
             .map(|id| {
+                tints.push(None);
                 let (key, image) = texture_key(model, id)?;
+                tints[id] = Some(mean_colour(&image.rgba));
                 let reused = self
                     .texture_by_content
                     .get(&key)
@@ -390,6 +424,7 @@ impl ModelAssets {
                 Some(handle)
             })
             .collect();
+        self.tints = tints;
 
         self.hulls.clear();
         self.recount(meshes);
@@ -655,6 +690,22 @@ struct TextureSource {
     width: u32,
     height: u32,
     format: TextureFormat,
+}
+
+/// The mean colour of RGBA texels, of a few thousand of them spread over
+/// the image: a hue to name the texture by, not a measure of it.
+fn mean_colour(rgba: &[u8]) -> [f32; 3] {
+    let texels = rgba.as_chunks::<4>().0;
+    let step = (texels.len() / 4096).max(1);
+    let (mut sum, mut n) = ([0u64; 3], 0u64);
+    for texel in texels.iter().step_by(step) {
+        for (s, v) in sum.iter_mut().zip(texel) {
+            *s += u64::from(*v);
+        }
+        n += 1;
+    }
+    #[allow(clippy::cast_precision_loss)] // a mean of bytes
+    sum.map(|s| s as f32 / (255.0 * n.max(1) as f32))
 }
 
 /// A hash of a 2D texture's pixels, size and colour space, and the decoded

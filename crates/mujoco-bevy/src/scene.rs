@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use bevy::ecs::system::SystemParam;
 use bevy::light::NotShadowCaster;
-use bevy::pbr::wireframe::Wireframe;
+use bevy::pbr::wireframe::{Wireframe, WireframeColor};
 use bevy::prelude::*;
 use mujoco_rs::prelude::*;
 
@@ -221,6 +221,8 @@ pub struct Surface {
     slot: GeomSlot,
     mesh: Handle<Mesh>,
     material: Handle<StandardMaterial>,
+    /// The colour its wires are drawn in: its own, or its texture's.
+    wire: Color,
     transform: Transform,
     casts_shadow: bool,
     counts: MeshCounts,
@@ -236,6 +238,11 @@ pub struct SurfaceAssets<'w> {
 }
 
 impl SurfaceAssets<'_> {
+    /// The material of a geom shown as its wires alone.
+    fn hidden_material(&mut self) -> Handle<StandardMaterial> {
+        self.model.hidden_material(&mut self.materials)
+    }
+
     /// The mesh, material and transform for a [`Kind::Surface`] geom: one
     /// shared unit mesh per primitive scaled by the geom's size (`MuJoCo`
     /// gives sizes as scales: radius, radius, half-length for a cylinder),
@@ -318,10 +325,16 @@ impl SurfaceAssets<'_> {
             texture: self.model.texture(geom.texid).filter(|_| has_uv),
             uv_scale,
         };
+        let tint = look
+            .texture
+            .and_then(|t| self.model.texture_tint(t))
+            .unwrap_or([1.0; 3]);
+        let [r, g, b, _] = geom.rgba;
         Some(Surface {
             slot: GeomSlot::of(0, geom),
             counts: self.model.counts(mesh.id()),
             mesh,
+            wire: Color::srgb(r * tint[0], g * tint[1], b * tint[2]),
             material: self.model.material(&mut self.materials, &look),
             transform,
             casts_shadow: geom.category != MjtCatBit::mjCAT_DECOR as i32 && geom.rgba[3] >= 0.999,
@@ -348,7 +361,7 @@ type Slots<'w, 's> = Query<
         &'static mut Transform,
         &'static mut Visibility,
         Has<NotShadowCaster>,
-        Has<Wireframe>,
+        Option<&'static mut WireframeColor>,
     ),
 >;
 
@@ -389,6 +402,7 @@ pub fn sync_surfaces(
         surface.slot.index = index;
         surface.casts_shadow &= options.shadows;
     }
+    let hidden = options.wireframe.then(|| assets.hidden_material());
 
     for (
         entity,
@@ -398,7 +412,7 @@ pub fn sync_surfaces(
         mut transform,
         mut visibility,
         shadowless,
-        wireframe,
+        wire,
     ) in &mut slots
     {
         let Some(surface) = surfaces.get(slot.index) else {
@@ -409,8 +423,11 @@ pub fn sync_surfaces(
         if mesh.0 != surface.mesh {
             mesh.0 = surface.mesh.clone();
         }
-        if material.0 != surface.material {
-            material.0 = surface.material.clone();
+        // As wires, the geom itself draws nothing: `MuJoCo`'s wireframe
+        // is the wires alone, each in its geom's colour.
+        let fill = hidden.as_ref().unwrap_or(&surface.material);
+        if material.0 != *fill {
+            material.0 = fill.clone();
         }
         transform.set_if_neq(surface.transform);
         visibility.set_if_neq(Visibility::Inherited);
@@ -421,12 +438,24 @@ pub fn sync_surfaces(
                 commands.entity(entity).insert(NotShadowCaster);
             }
         }
-        if wireframe != options.wireframe {
-            if options.wireframe {
-                commands.entity(entity).insert(Wireframe);
-            } else {
-                commands.entity(entity).remove::<Wireframe>();
+        let colour = WireframeColor {
+            color: surface.wire,
+        };
+        match (options.wireframe, wire) {
+            (true, Some(mut wire)) => {
+                if wire.color != colour.color {
+                    *wire = colour;
+                }
             }
+            (true, None) => {
+                commands.entity(entity).insert((Wireframe, colour));
+            }
+            (false, Some(_)) => {
+                commands
+                    .entity(entity)
+                    .remove::<(Wireframe, WireframeColor)>();
+            }
+            (false, None) => {}
         }
     }
 
@@ -438,7 +467,7 @@ pub fn sync_surfaces(
         let mut entity = commands.spawn((
             surface.slot,
             Mesh3d(surface.mesh.clone()),
-            MeshMaterial3d(surface.material.clone()),
+            MeshMaterial3d(hidden.clone().unwrap_or_else(|| surface.material.clone())),
             surface.transform,
             Visibility::Inherited,
         ));
@@ -446,7 +475,12 @@ pub fn sync_surfaces(
             entity.insert(NotShadowCaster);
         }
         if options.wireframe {
-            entity.insert(Wireframe);
+            entity.insert((
+                Wireframe,
+                WireframeColor {
+                    color: surface.wire,
+                },
+            ));
         }
     }
 
