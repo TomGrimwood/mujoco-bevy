@@ -40,7 +40,7 @@ pub use debug::{GroupKind, MjRenderOptions, Named, VisScale};
 pub use lights::{LightSettings, MjLight};
 pub use loading::PipelinesPending;
 pub use mujoco_bevy_assets::MeshCounts;
-pub use mujoco_bevy_assets::{ModelAssets, RebuildStats};
+pub use mujoco_bevy_assets::{ModelAssets, RebuildStats, repeating_image};
 pub use pick::{Pick, Picked, Selection, pick};
 pub use scene::{DrawCounts, GeomSlot, GeomStats, Label, Labels};
 pub use stats::{

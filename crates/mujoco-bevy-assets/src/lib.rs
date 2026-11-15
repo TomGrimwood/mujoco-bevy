@@ -819,6 +819,22 @@ fn decode_texture(model: &MjModel, id: usize) -> Option<TextureSource> {
     })
 }
 
+/// RGBA pixels as a repeating image with a full mip chain: a tiling
+/// texture of a host's own (sRGB colour, or `linear` data).
+#[must_use]
+pub fn repeating_image(rgba: Vec<u8>, width: u32, height: u32, linear: bool) -> Image {
+    build_texture(TextureSource {
+        rgba,
+        width,
+        height,
+        format: if linear {
+            TextureFormat::Rgba8Unorm
+        } else {
+            TextureFormat::Rgba8UnormSrgb
+        },
+    })
+}
+
 /// An sRGB (or linear, if the model says so) RGBA image with a full mip
 /// chain, repeating, as `MuJoCo` samples it.
 fn build_texture(source: TextureSource) -> Image {
