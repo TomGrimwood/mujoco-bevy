@@ -417,7 +417,7 @@ fn sync_parts(
     mut parts: Query<(
         Entity,
         &MjVisualGeom,
-        &mut MeshMaterial3d<StandardMaterial>,
+        Option<&mut MeshMaterial3d<StandardMaterial>>,
         &mut Visibility,
         Has<MjHiddenGeom>,
         Has<NotShadowCaster>,
@@ -428,7 +428,7 @@ fn sync_parts(
     let hidden_fill = options
         .wireframe
         .then(|| assets.hidden_material(&mut materials));
-    for (entity, geom, mut material, mut visibility, hidden, shadowless, wire) in &mut parts {
+    for (entity, geom, material, mut visibility, hidden, shadowless, wire) in &mut parts {
         let shown = !hidden
             && usize::try_from(geom.group)
                 .ok()
@@ -445,8 +445,12 @@ fn sync_parts(
         } else {
             Visibility::Hidden
         });
+        // A host may draw a part in a material of its own (one extended
+        // from its fill); it is still shown, shadowed and wired here.
         let fill = hidden_fill.as_ref().unwrap_or_else(|| geom.fill());
-        if material.0 != *fill {
+        if let Some(mut material) = material
+            && material.0 != *fill
+        {
             material.0 = fill.clone();
         }
         if shadowless == options.shadows {
