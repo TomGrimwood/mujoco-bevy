@@ -169,6 +169,27 @@ pub struct MjVisuals {
     pub counts: MeshCounts,
 }
 
+impl MjVisuals {
+    /// 2D texture `name` of `model` (this look's), built on first ask. A
+    /// look builds only the textures its materials draw with; a host that
+    /// restyles a part with another (a livery) gets it here, built on the
+    /// calling thread.
+    pub fn texture(
+        &mut self,
+        model: &MjModel,
+        name: &str,
+        images: &mut Assets<Image>,
+    ) -> Option<Handle<Image>> {
+        if let Some(handle) = self.textures.get(name) {
+            return Some(handle.clone());
+        }
+        let id = model.name_to_id(MjtObjBase::mjOBJ_TEXTURE, name)?;
+        let handle = images.add(build_model_texture(model, id)?.image);
+        self.textures.insert(name.to_owned(), handle.clone());
+        Some(handle)
+    }
+}
+
 /// One visual geom of a look.
 pub struct VisualPart {
     /// Its body's name in the look (unprefixed).
