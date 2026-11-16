@@ -557,7 +557,6 @@ mod tests {
     use std::ffi::{CStr, c_char};
 
     use super::*;
-    use mujoco_rs::mujoco_c;
 
     fn c_name(ptr: *const c_char) -> &'static str {
         // SAFETY: `MuJoCo`'s name tables are static NUL-terminated strings.
@@ -569,10 +568,10 @@ mod tests {
         // SAFETY: reads of `MuJoCo`'s constant string tables.
         let (vis, rnd, label, frame) = unsafe {
             (
-                mujoco_c::mjVISSTRING,
-                mujoco_c::mjRNDSTRING,
-                mujoco_c::mjLABELSTRING,
-                mujoco_c::mjFRAMESTRING,
+                crate::dll::mj_vis_string(),
+                crate::dll::mj_rnd_string(),
+                crate::dll::mj_label_string(),
+                crate::dll::mj_frame_string(),
             )
         };
         for (k, flag) in VIS_FLAGS.iter().enumerate() {
@@ -596,7 +595,12 @@ mod tests {
     #[test]
     fn the_physics_flags_are_named_as_mujoco_names_them() {
         // SAFETY: reads of `MuJoCo`'s constant string tables.
-        let (disable, enable) = unsafe { (mujoco_c::mjDISABLESTRING, mujoco_c::mjENABLESTRING) };
+        let (disable, enable) = unsafe {
+            (
+                crate::dll::mj_disable_string(),
+                crate::dll::mj_enable_string(),
+            )
+        };
         for (k, name) in DISABLE_FLAGS.iter().enumerate() {
             assert_eq!(*name, c_name(disable[k]));
         }

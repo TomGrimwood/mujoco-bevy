@@ -204,11 +204,13 @@ pub fn install_timer() -> bool {
     EPOCH.get_or_init(Instant::now);
     // SAFETY: a plain read and write of a C global holding a function
     // pointer, done while nothing steps (see above); `clock` is a valid
-    // `mjfTime` for the life of the process.
+    // `mjfTime` for the life of the process. On Windows this goes through
+    // the DLL import thunk ([`crate::dll::mjcb_time`]).
     unsafe {
-        match mujoco_c::mjcb_time {
+        let slot = &mut *crate::dll::mjcb_time();
+        match *slot {
             None => {
-                mujoco_c::mjcb_time = Some(ours);
+                *slot = Some(ours);
                 true
             }
             Some(set) => std::ptr::fn_addr_eq(set, ours),
@@ -781,7 +783,7 @@ mod tests {
     #[test]
     fn timer_names_and_paths_are_mujocos() {
         // SAFETY: a read of `MuJoCo`'s constant string table.
-        let names = unsafe { mujoco_c::mjTIMERSTRING };
+        let names = unsafe { crate::dll::mj_timer_string() };
         for (k, timer) in TIMERS.iter().enumerate() {
             assert_eq!(timer.value as usize, k);
             // SAFETY: static NUL-terminated strings.

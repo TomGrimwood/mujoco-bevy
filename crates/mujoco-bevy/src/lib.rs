@@ -20,14 +20,16 @@
 //! [`ModelCamera`].
 
 use bevy::asset::AssetEventSystems;
-use bevy::pbr::wireframe::WireframePlugin;
+use bevy::pbr::wireframe::{specialize_wireframes, WireframePlugin};
 use bevy::prelude::*;
-use bevy::render::RenderApp;
+use bevy::render::camera::{DirtySpecializations, DirtyWireframeSpecializations};
+use bevy::render::{Render, RenderApp, RenderSystems};
 use bevy::transform::TransformSystems;
 use mujoco_rs::prelude::*;
 
 mod camera;
 pub mod debug;
+mod dll;
 mod lights;
 mod loading;
 mod pick;
@@ -356,6 +358,21 @@ impl Plugin for MujocoScenePlugin {
         if app.get_sub_app(RenderApp).is_some() && !app.is_plugin_added::<WireframePlugin>() {
             app.add_plugins(WireframePlugin::default());
         }
+        // Bevy's `check_views_need_specialization` wipes *material*
+        // pipelines when `Msaa` (or other view-key bits) change, but not
+        // wireframe ones: the pass then uses the new sample count while
+        // `wireframe_3d_pipeline` still has the old, and validation quits
+        // the app. Mirror the dirty views into the wireframe list.
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            // After PrepareAssets (where the view-key dirty list is filled)
+            // and before Bevy specializes wireframe pipelines.
+            render_app.add_systems(
+                Render,
+                wipe_wireframe_pipelines_when_view_key_changes
+                    .in_set(RenderSystems::Specialize)
+                    .before(specialize_wireframes),
+            );
+        }
         app.add_plugins(mujoco_bevy_assets::MujocoAssetsPlugin)
             .init_resource::<MjRenderOptions>()
             .init_resource::<Labels>()
@@ -472,6 +489,16 @@ fn rewrite_meshes(
     for id in ids {
         assets.update_mesh(view.model(), id, &mut meshes);
     }
+}
+
+/// Copies view-key dirty marks onto the wireframe specialization list so
+/// `wireframe_3d` pipelines are rebuilt with the same sample count as the
+/// pass (see the note on [`MujocoScenePlugin::build`]).
+fn wipe_wireframe_pipelines_when_view_key_changes(
+    dirty: Res<DirtySpecializations>,
+    mut dirty_wire: ResMut<DirtyWireframeSpecializations>,
+) {
+    dirty_wire.views.extend(dirty.views.iter().copied());
 }
 
 /// `MuJoCo`'s row-major rotation as a quaternion.
