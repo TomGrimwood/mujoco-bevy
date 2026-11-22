@@ -606,7 +606,18 @@ pub fn standard_material(
     // Bevy's emissive is a luminance that the camera's exposure scales
     // down by about a thousand, where `MuJoCo`'s is a fraction of the
     // colour; this makes emission 1 about as bright as a sunlit face.
-    let emissive = LinearRgba::from(Color::srgb(r, g, b)) * (look.emission * 1000.0);
+    let colour = LinearRgba::from(Color::srgb(r, g, b));
+    // A textured material glows with its texture, as in `MuJoCo`, at the
+    // texture's own brightness: a lit screen shows its image, where the
+    // flat luminance above would wash it out to white.
+    let glows = look.emission > 0.0;
+    let emissive_texture = glows.then(|| texture.clone()).flatten();
+    let scale = if emissive_texture.is_some() {
+        1.0
+    } else {
+        1000.0
+    };
+    let emissive = colour * (look.emission * scale);
     // A material that says what it is made of is drawn as that. One that
     // does not, by eye: `MuJoCo`'s Phong shininess and specular weight
     // to a roughness and a reflectance that look about as glossy.
@@ -635,6 +646,7 @@ pub fn standard_material(
         base_color_texture: texture,
         uv_transform: Affine2::from_scale(look.uv_scale),
         emissive,
+        emissive_texture,
         metallic,
         perceptual_roughness,
         reflectance,
